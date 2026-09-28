@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ghdl · GitHub 代理下载</title>
+<script>
+  // 主题固定可爱；想换一套就把这里的 'cute' 改成 simple / dark / paper（四套都在 style.css 里）
+  document.documentElement.dataset.theme = 'cute';
+</script>
+<link rel="stylesheet" href="/static/animate.css">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <div class="brand"><b>ghdl</b><span>GitHub 代理下载 · 本地网页版</span></div>
+  <div class="hright">
+    <span id="status" class="pill">连接中…</span>
+    <button id="btn-stop" class="mini ghost" title="关掉后台服务（打包成 exe 后没有命令行窗口，就在这里停）">停止服务</button>
+  </div>
+</header>
+
+<div id="banner" class="banner hidden"></div>
+
+<main>
+  <!-- ① 下东西 -->
+  <section class="card fx-in" id="sec-new" style="--d:.02s">
+    <h2>下载</h2>
+
+    <label for="url">GitHub 链接（release 文件 / raw 单文件 / 整仓 zip / 仓库页 / 已带代理的加速链接都认）</label>
+    <div class="row">
+      <input id="url" type="text" spellcheck="false" autocomplete="off"
+             placeholder="https://github.com/Eugeny/tabby/releases/download/v1.0.237/tabby-1.0.237-setup-x64.exe">
+      <button id="btn-assets" class="ghost" title="贴的是 /releases 发布页时，列出它下面的文件让你点">列出该页文件</button>
+    </div>
+    <div id="assetbox" class="assetbox hidden"></div>
+
+    <label for="destdir">下载目录</label>
+    <div class="row">
+      <input id="destdir" type="text" spellcheck="false" autocomplete="off" placeholder="D:\Downloads">
+      <button id="btn-browse" class="ghost">浏览…</button>
+    </div>
+    <div id="dirpick" class="dirpick hidden"></div>
+    <div id="quickdirs" class="chips"></div>
+
+    <label>方式</label>
+    <div class="row modes">
+      <label><input type="radio" name="mode" value="auto" checked> 自动</label>
+      <label><input type="radio" name="mode" value="file"> 只当文件下</label>
+      <label><input type="radio" name="mode" value="clone"> 强制 git clone</label>
+      <label class="right"><input type="checkbox" id="chk-verify" checked> 下完做校验</label>
+    </div>
+
+    <div class="row actions">
+      <button id="btn-go" class="primary">开始下载</button>
+      <span id="gohint" class="muted">Ctrl+Enter 也可以启动。同名文件会自动加 (2)，不覆盖你已有的。</span>
+    </div>
+  </section>
+
+  <!-- ② 任务 -->
+  <section class="card fx-in" id="sec-tasks" style="--d:.09s">
+    <h2>任务 <span id="taskcount" class="muted"></span></h2>
+    <div id="tasks" class="tasks"><div class="muted empty">还没有任务。粘贴一个链接，按开始下载。</div></div>
+  </section>
+
+  <!-- ②b 校验已经在本地的文件 -->
+  <section class="card fx-in" id="sec-verify" style="--d:.16s">
+    <h2>校验本地文件 <span class="muted">不下载，只查这个文件本身完不完整</span></h2>
+    <label for="vpath">文件路径</label>
+    <div class="row">
+      <input id="vpath" type="text" spellcheck="false" autocomplete="off"
+             placeholder="D:\Downloads\tabby-1.0.237-setup-x64.exe">
+      <button id="btn-vbrowse" class="ghost">选文件…</button>
+    </div>
+    <div id="vpick" class="dirpick hidden"></div>
+    <label for="vurl">这个文件自己的下载链接（选填。填了会去同一个 release 找作者公布的校验值比对；填发布页地址没用，要右键复制那种指向具体文件的链接）</label>
+    <div class="row">
+      <input id="vurl" type="text" spellcheck="false" autocomplete="off"
+             placeholder="https://github.com/作者/仓库/releases/download/版本/文件名">
+    </div>
+    <div class="row actions">
+      <button id="btn-verify" class="primary">开始校验</button>
+      <span id="vhint" class="muted">结果出现在上面的任务列表里；几 GB 的文件要等几十秒，期间可以取消。</span>
+    </div>
+  </section>
+
+  <!-- ③ 代理 -->
+  <section class="card fx-in" id="sec-proxy" style="--d:.23s">
+    <h2>代理源
+      <button id="btn-probe" class="mini">全部测速</button>
+      <span id="probeout" class="muted"></span>
+    </h2>
+    <table class="tbl">
+      <thead><tr><th>序</th><th>用</th><th>名称</th><th>前缀（拼在完整地址前面）</th><th>最近测速</th><th>成功/尝试</th><th></th></tr></thead>
+      <tbody id="proxy-body"></tbody>
+    </table>
+    <div class="row addrow">
+      <input id="px-name" type="text" placeholder="名称，如 my-proxy" class="small">
+      <input id="px-prefix" type="text" placeholder="前缀，如 https://my-proxy.example/ （只填域名也行）">
+      <button id="btn-px-add" class="ghost">添加</button>
+    </div>
+    <p class="muted tight">
+      这些站子经常换，测速列一片红就说明该更新列表了。想自己搭一个稳定源（Cloudflare Workers，免费额度够用），
+      看 README 最后一节。
+    </p>
+  </section>
+
+  <!-- ④ 历史 -->
+  <section class="card fx-in" id="sec-hist" style="--d:.30s">
+    <h2>历史 <span id="histcount" class="muted"></span></h2>
+    <table class="tbl">
+      <thead><tr><th>时间</th><th>文件</th><th>大小</th><th>速度</th><th>源</th><th>校验</th><th></th></tr></thead>
+      <tbody id="hist-body"></tbody>
+    </table>
+  </section>
+</main>
+
+<footer class="muted">
+  只监听 127.0.0.1，配置和历史都在本目录 data/ 里，删掉 <code>githubDownload</code> 文件夹就是彻底卸载，不留东西。
+</footer>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

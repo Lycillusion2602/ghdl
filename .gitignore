@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+data/
+_selftest_out/
+_selftest_data/
+_selftest_exe_data/
+build/
+dist/
+ghdl.exe
+.idea/
+.vscode/
