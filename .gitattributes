@@ -1,7 +1,7 @@
-# Windows 专用项目：不让 git 改任何文件的行尾（.bat/.ps1 被转成 LF 会行为异常）
-* -text
-
-# 二进制
+# 统一按 LF 入库、按平台检出；只有 .bat 必须 CRLF（cmd 读 LF 会截断命令）
+* text=auto eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
 *.exe binary
 *.png binary
 *.ico binary
