@@ -8,8 +8,12 @@
 **最简单：双击 `ghdl.exe`** → 浏览器自动打开 `http://127.0.0.1:8765/`。它不依赖 Python（Python 卸载了也能跑），
 没有命令行窗口，要停止就在**页面右上角按「停止服务」**。
 
-> `ghdl.exe` 不在仓库里（二进制不便做版本管理）。自己打一个：双击 `打包.bat`，产物在 `dist\ghdl.exe`，
-> 会被自动复制到本目录。需要 PyInstaller（`python -m pip install pyinstaller`）。
+> **拿现成的**：去 [Releases](../../releases) 下载 `ghdl.exe`（单文件，不需要装 Python）。
+> 它**没有代码签名**，Windows 首次运行会弹 SmartScreen「已保护你的电脑 / 未知发布者」——
+> 点「更多信息 → 仍要运行」即可；Release 说明里附了 SHA256，不放心可以先比对再跑。
+> **自己打一个**：双击 `打包.bat`，产物在 `dist\ghdl.exe`，会自动复制到本目录（需要
+> `python -m pip install pyinstaller`）。源码全公开，比对哈希后自己打包是最稳的路。
+> `ghdl.spec` 也不进仓库（那是 PyInstaller 每次重新生成的产物，且含生成机器的绝对路径）。
 > 不想装任何 Python 包的话，`start.bat` 那条路功能完全一样，只是多一个命令行窗口。
 
 也可以用 `start.bat`（会留一个黑色命令行窗口，关窗口就是停止；好处是改完 `server.py` 立刻生效，不用重新打包）。

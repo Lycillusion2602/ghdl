@@ -7,5 +7,6 @@ _selftest_exe_data/
 build/
 dist/
 ghdl.exe
+ghdl.spec
 .idea/
 .vscode/
