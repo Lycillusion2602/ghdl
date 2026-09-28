@@ -3,7 +3,7 @@
 """
 ghdl 自测：改完代码跑一下，确认没把核心路径改坏。
 
-跑法：双击 自测.bat，或命令行 `py -3 selftest.py`
+跑法：双击 ghdl.bat 选 2，或命令行 `py -3 selftest.py`
 它用临时目录（_selftest_data）和备用端口 8899 起一个独立实例，不碰你真正的
 data/ 配置和历史；测完自己清理。要联网（会真下两个小文件，一共几 KB）。
 
@@ -93,6 +93,28 @@ html = open(os.path.join(PROJ, "static", "index.html"), encoding="utf-8").read()
 js = open(os.path.join(PROJ, "static", "app.js"), encoding="utf-8").read()
 css = open(os.path.join(PROJ, "static", "style.css"), encoding="utf-8").read()
 chk("三个前端文件都非空", len(html) > 800 and len(js) > 3000 and len(css) > 800)
+
+# ============================================================ 1b 入口与版本一致性
+print("=== 1b. 入口与版本一致性 ===")
+chk("开发入口收敛成一个 ghdl.bat", os.path.exists(os.path.join(PROJ, "ghdl.bat")))
+gone_bats = [n for n in ("start.bat", "自测.bat", "打包.bat") if os.path.exists(os.path.join(PROJ, n))]
+chk("旧的三个 .bat 已删（文档说的入口必须真存在）", not gone_bats, gone_bats)
+bb = open(os.path.join(PROJ, "ghdl.bat"), "rb").read() if os.path.exists(os.path.join(PROJ, "ghdl.bat")) else b""
+chk("ghdl.bat 纯 ASCII + 全 CRLF（cmd 读 UTF-8 中文会乱码）",
+    bool(bb) and all(c < 128 for c in bb) and bb.count(b"\n") == bb.count(b"\r\n") and bb.count(b"\r\n") > 10)
+chk("菜单五个分支齐", all(k in bb.decode("ascii", "replace") for k in (":run", ":test", ":pack", ":stop", ":ver")))
+vf = subprocess.run([sys.executable, os.path.join(PROJ, "server.py"), "--version"],
+                    capture_output=True, text=True, encoding="utf-8", errors="replace")
+chk("--version 打印的就是 server.py 里的 APP_VERSION",
+    vf.returncode == 0 and SV.APP_VERSION in (vf.stdout or ""), (vf.stdout or vf.stderr).strip()[:60])
+chk("前端没写死版本号（只从 /api/state 取）",
+    re.search(r"\b\d+\.\d+\.\d+\b", js) is None and "r.version" in js)
+wf = os.path.join(PROJ, ".github", "workflows", "release.yml")
+chk("CI 配置在位", os.path.exists(wf))
+if os.path.exists(wf):
+    ytxt = open(wf, encoding="utf-8").read()
+    chk("CI 先跑自测、并卡 tag 与 APP_VERSION 一致",
+        "selftest.py" in ytxt and "APP_VERSION" in ytxt and "tags" in ytxt)
 
 # ============================================================ 2 解析
 print("=== 2. 链接解析 ===")
@@ -339,7 +361,8 @@ for _ in range(60):
         time.sleep(0.3)
 chk("服务在备用端口起来了", up)
 base = req("/api/state")
-chk("state 字段齐", {"config", "proxies", "tasks", "history"} <= set(base), sorted(base))
+chk("state 字段齐", {"config", "proxies", "tasks", "history", "version"} <= set(base), sorted(base))
+chk("接口报的版本号 = 代码里的 APP_VERSION", base.get("version") == SV.APP_VERSION, base.get("version"))
 chk("默认 4 条源（3 个实测站 + 直连兜底）", len(base["proxies"]) == 4,
     [p["name"] for p in base["proxies"]])
 chk("首页 HTML 出得来", "<title>ghdl" in urllib.request.urlopen(
@@ -666,11 +689,11 @@ if os.path.exists(exe):
         ep.kill()
     shutil.rmtree(edata, ignore_errors=True)
 else:
-    info("跳过 exe 测试", "还没打包 —— 双击 打包.bat 生成 ghdl.exe 后再跑一次自测")
+    info("跳过 exe 测试", "还没打包 —— 双击 ghdl.bat 选 3 生成 ghdl.exe 后再跑一次自测")
 shutil.rmtree(OUT, ignore_errors=True)
 
 print("\n=== 结果 ===")
-print("全部通过，可以双击 start.bat 用了" if not FAILS else "有 %d 项没过：" % len(FAILS))
+print("全部通过，可以用了（ghdl.bat 选 1 启动）" if not FAILS else "有 %d 项没过：" % len(FAILS))
 for f in FAILS:
     print("  x " + f)
 sys.exit(1 if FAILS else 0)

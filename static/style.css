@@ -185,6 +185,7 @@ header {
 }
 .brand b { font-size: 18px; letter-spacing: .5px; }
 .brand span { color: var(--muted); margin-left: 10px; font-size: 12px; }
+.brand .ver { margin-left: 8px; font-size: 11px; border: 1px solid var(--line); border-radius: 999px; padding: 1px 8px; }
 .hright { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 main { max-width: 1060px; margin: 0 auto; padding: 18px 16px 0; }
 .card {

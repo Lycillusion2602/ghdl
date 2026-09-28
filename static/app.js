@@ -448,6 +448,8 @@ async function poll(now) {
     failCount = 0;
     el.status.textContent = '服务在线 · 已运行 ' + fmtDur(r.up);
     el.status.className = 'pill on';
+    const ver = $('#ver');
+    if (ver) ver.textContent = r.version ? 'v' + r.version : '';   // 版本号只由后端提供，前端不写死
     if (!el.destdir.value.trim() && r.config) el.destdir.value = r.config.default_dir || '';
     el.verify.checked = r.config.verify !== false;
     renderQuick(r.config || {});

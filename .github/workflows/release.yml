@@ -1,0 +1,72 @@
+name: 打 exe 并发 Release
+# 只有打 tag（比如 v1.1.0）才跑：先跑自测，通过了才构建、才发布。
+# 这样"包比源码旧"和"发出去的东西没验过"两件事都被堵在流程里。
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 装 PyInstaller
+        run: python -m pip install --upgrade pip pyinstaller
+
+      - name: 版本号必须和 tag 一致（防止 tag 说 1.2.0、界面里写 1.1.0）
+        shell: python
+        run: |
+          import os, re, sys
+          src = open("server.py", encoding="utf-8").read()
+          ver = re.search(r'APP_VERSION\s*=\s*"([^"]+)"', src).group(1)
+          tag = os.environ["GITHUB_REF_NAME"].lstrip("v")
+          print("server.py =", ver, " tag =", tag)
+          sys.exit(0 if ver == tag else "不一致，停：先改 server.py 里的 APP_VERSION 再打 tag")
+
+      - name: 跑自测（不通过就不出包）
+        run: python selftest.py
+        env:
+          GHDL_PORT: "8899"
+
+      - name: 构建单文件 exe
+        run: >
+          pyinstaller --noconfirm --clean --onefile --windowed --name ghdl
+          --add-data "static;static" server.py
+
+      - name: 算 SHA256 写进 Release 说明
+        shell: pwsh
+        run: |
+          $h = (Get-FileHash dist\ghdl.exe -Algorithm SHA256).Hash.ToLower()
+          $v = $env:GITHUB_REF_NAME
+          @"
+          ghdl $v —— 单文件 GitHub 代理下载器。下载 ``ghdl.exe`` 双击即可，不需要装 Python。
+
+          | 项 | 值 |
+          |---|---|
+          | 大小 | $((Get-Item dist\ghdl.exe).Length) 字节 |
+          | SHA256 | ``$h`` |
+
+          **没有代码签名**：首次运行 Windows 会弹 SmartScreen「未知发布者」，点「更多信息 → 仍要运行」。
+          这是未签名 PyInstaller 单文件程序的正常表现。不放心的话先比对上面的 SHA256，
+          或者 clone 源码自己 ``pyinstaller`` 打一份（源码、构建参数、自测脚本全公开）。
+
+          停止服务：页面右上角「停止服务」。数据存在 exe 旁边的 ``data/``。
+          构建环境：GitHub windows-latest runner · Python 3.12 · PyInstaller（见 Actions 日志）。
+          本 Release 由 CI 自动发布：先跑完 selftest（90+ 项）通过才出包。
+          "@ | Out-File -Encoding utf8 release-notes.md
+          Get-Content release-notes.md
+
+      - name: 发 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/ghdl.exe
+          body_path: release-notes.md
+          name: ghdl ${{ github.ref_name }}
+          prerelease: false

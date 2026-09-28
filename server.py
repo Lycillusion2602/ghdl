@@ -3,7 +3,7 @@
 """
 ghdl —— GitHub 代理下载工具（本地网页版）
 
-启动：双击 start.bat（或命令行 `py -3 server.py`）→ 自动打开 http://127.0.0.1:8765
+启动：双击 ghdl.bat 选 1（或命令行 `py -3 server.py`）→ 自动打开 http://127.0.0.1:8765
 只监听 127.0.0.1，不对外开放；不写注册表、不需要管理员权限、除 Python 标准库外无依赖。
 
 文件分工（为什么这么写、改哪里，见 实现导读.md）：
@@ -31,6 +31,7 @@ import traceback
 import uuid
 import webbrowser
 import zipfile
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -53,6 +54,9 @@ def say(msg):
         pass
 
 FROZEN = bool(getattr(sys, "frozen", False))          # PyInstaller 打包后为 True
+# 版本号的唯一出处。发版流程：改这一行 → commit → 打同名 tag（去掉 v）→ CI 会比对，
+# 不一致就直接失败不出包，避免"tag 说 1.2.0、界面里写 1.1.0"这种事。
+APP_VERSION = "1.1.0"
 # 打包后 __file__ 指向临时解压目录（_MEIxxxxxx，每次运行都换、退出就没了）。
 # 若还用它的目录当 BASE，data/ 会被写进临时目录里 —— 配置和历史每次都丢。
 # 所以：可写数据一律放 exe 旁边；只读的 static 优先用 exe 旁边的（方便他改样式），
@@ -1272,7 +1276,7 @@ CTYPES = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8"
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "ghdl/1.0"
+    server_version = "ghdl"      # 版本号统一从 APP_VERSION 走，别在这里再写一遍
 
     def log_message(self, fmt, *args):
         pass
@@ -1348,8 +1352,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/state":
             with LOCK:
                 tasks = [task_public(t) for t in sorted(TASKS.values(), key=lambda x: -(x.get("started") or 0))[:30]]
-            return self.send_json({"ok": True, "config": get_config(), "proxies": get_proxies(),
-                                   "tasks": tasks, "history": get_history()[:80],
+            return self.send_json({"ok": True, "version": APP_VERSION, "config": get_config(),
+                                   "proxies": get_proxies(), "tasks": tasks,
+                                   "history": get_history()[:80],
                                    "up": int(time.time() - STARTED_AT)})
 
         if path == "/api/download":
@@ -1508,6 +1513,20 @@ def find_port(base, tries=8):
 
 def main():
     global SERVER
+    if "--version" in sys.argv:
+        say("ghdl %s（打包版=%s）" % (APP_VERSION, FROZEN))
+        return
+    if "--stop" in sys.argv:
+        # 给 .bat / 命令行用的停止入口：逻辑放这儿，别在批处理里拼 JSON 转义（那种写法很容易出错）
+        port = int(os.environ.get("GHDL_PORT") or get_config().get("port") or 8765)
+        try:
+            rq = urllib.request.Request("http://127.0.0.1:%d/api/shutdown" % port,
+                                        data=b'{"force": true}',
+                                        headers={"Content-Type": "application/json"})
+            say("已通知 %d 端口的服务退出：%s" % (port, urllib.request.urlopen(rq, timeout=10).read().decode("utf-8")))
+        except Exception as e:
+            say("没连上服务（也许本来就停着）：%s" % e)
+        return
     ensure_data()
     cfg = get_config()
     base_port = int(os.environ.get("GHDL_PORT") or cfg.get("port") or 8765)
