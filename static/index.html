@@ -3,7 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ghdl · GitHub 代理下载</title>
+<title>ghdl · 下载与转换</title>
+<link rel="icon" type="image/x-icon" href="/static/logo.ico">
 <script>
   // 主题固定可爱；想换一套就把这里的 'cute' 改成 simple / dark / paper（四套都在 style.css 里）
   document.documentElement.dataset.theme = 'cute';
@@ -12,112 +13,294 @@
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-<header>
-  <div class="brand"><b>ghdl</b><span>GitHub 代理下载 · 本地网页版</span><span class="ver" id="ver" title="点右上角「停止服务」可以关掉后台"></span></div>
-  <div class="hright">
-    <span id="status" class="pill">连接中…</span>
-    <button id="btn-stop" class="mini ghost" title="关掉后台服务（打包成 exe 后没有命令行窗口，就在这里停）">停止服务</button>
+<div class="app">
+  <!-- 左侧导航：Vuexy 式 vertical menu（品牌 / 分组 / 菜单项 / 底部信息） -->
+  <aside class="sidebar" id="sidebar">
+    <a class="sb-brand" href="#sec-new" data-nav="sec-new" data-title="下载">
+      <img class="brand-logo" src="/static/logo.png" alt="">
+      <span class="brand-text"><b>ghdl</b><small>下载与格式转换</small></span>
+    </a>
+    <nav class="sb-nav" aria-label="主导航">
+      <div class="sb-sec">工作台</div>
+      <a class="sb-item active" href="#sec-new" data-nav="sec-new" data-title="下载">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 21h16"/></svg>
+        <span>下载</span>
+      </a>
+      <a class="sb-item" href="#sec-convert" data-nav="sec-convert" data-title="转换">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h13l-3-3m3 3-3 3M20 17H7l3-3m-3 3 3 3"/></svg>
+        <span>格式转换</span>
+      </a>
+      <a class="sb-item" href="#sec-tasks" data-nav="sec-tasks" data-title="任务">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></svg>
+        <span>任务</span>
+        <em class="sb-badge hidden" id="nav-busy">0</em>
+      </a>
+      <div class="sb-sec">工具</div>
+      <a class="sb-item" href="#sec-verify" data-nav="sec-verify" data-title="校验">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l7 3v6c0 4-3 7-7 9-4-2-7-5-7-9V6l7-3Z"/><path d="m9 12 2 2 4-4"/></svg>
+        <span>校验本地文件</span>
+      </a>
+      <a class="sb-item" href="#sec-proxy" data-nav="sec-proxy" data-title="代理源">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c3 3 3 15 0 18M12 3c-3 3-3 15 0 18"/></svg>
+        <span>代理源</span>
+      </a>
+      <div class="sb-sec">记录</div>
+      <a class="sb-item" href="#sec-hist" data-nav="sec-hist" data-title="历史">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
+        <span>历史</span>
+      </a>
+    </nav>
+    <div class="sb-foot">
+      <span class="sb-dot"></span>
+      <span>本地服务 · <span class="ver" id="ver"></span></span>
+    </div>
+  </aside>
+  <div class="sb-mask" id="sb-mask"></div>
+
+  <div class="main">
+    <!-- 顶部导航：面包屑 + 状态 + 停止 -->
+    <header class="topbar">
+      <button id="btn-menu" class="icon-btn" type="button" aria-label="展开菜单" title="菜单">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+      </button>
+      <div class="crumb"><span>工作台</span><i>/</i><b id="page-title">下载</b></div>
+      <div class="hright">
+        <span id="status" class="pill">连接中…</span>
+        <button id="btn-stop" class="mini ghost" title="关掉后台服务（打包成 exe 后没有命令行窗口，就在这里停）">停止服务</button>
+      </div>
+    </header>
+
+    <div id="banner" class="banner hidden"></div>
+
+    <main class="content">
+      <!-- 概览：Vuexy 式 stat cards -->
+      <div class="stats">
+        <div class="stat">
+          <span class="stat-ico acc"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 21h16"/></svg></span>
+          <div class="stat-txt"><small>进行中任务</small><b id="stat-busy">0</b></div>
+        </div>
+        <div class="stat">
+          <span class="stat-ico ok"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7 9 18l-5-5"/></svg></span>
+          <div class="stat-txt"><small>今日下载</small><b id="stat-today">0</b></div>
+        </div>
+        <div class="stat">
+          <span class="stat-ico warn"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16v13H4z"/><path d="M2 3h20v4H2z"/><path d="M10 12h4"/></svg></span>
+          <div class="stat-txt"><small>最近完成</small><b id="stat-total">0</b></div>
+        </div>
+        <div class="stat">
+          <span class="stat-ico bad"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l8 4v5c0 5-3.5 8-8 9-4.5-1-8-4-8-9V7l8-4Z"/></svg></span>
+          <div class="stat-txt"><small>可用引擎</small><b id="stat-engines">0/0</b></div>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <!-- ① 下东西 -->
+        <section class="card fx-in" id="sec-new" style="--d:.02s">
+          <h2>下载 <span class="muted">GitHub 加速 / 任意 http(s) 链接</span></h2>
+
+          <label for="url">下载链接（一行一个，可以一次粘一批）</label>
+          <div class="row">
+            <textarea id="url" rows="3" spellcheck="false" autocomplete="off"
+                   placeholder="https://github.com/Eugeny/tabby/releases/download/v1.0.237/tabby-1.0.237-setup-x64.exe&#10;https://example.com/files/report.pdf"></textarea>
+            <div class="btncol">
+              <button id="btn-assets" class="ghost" title="贴的是 /releases 发布页时，列出它下面的文件让你点">列出该页文件</button>
+              <button id="btn-paste" class="ghost" title="把剪贴板里的链接追加进来">粘贴</button>
+            </div>
+          </div>
+          <div id="assetbox" class="assetbox hidden"></div>
+
+          <label for="destdir">下载目录</label>
+          <div class="row">
+            <input id="destdir" type="text" spellcheck="false" autocomplete="off" placeholder="D:\Downloads">
+            <button id="btn-browse" class="ghost">浏览…</button>
+            <button id="btn-tree" class="ghost" title="系统选择框打不开时，用网页里的目录树">目录树</button>
+          </div>
+          <div id="dirpick" class="dirpick hidden"></div>
+          <div id="quickdirs" class="chips"></div>
+
+          <details class="adv">
+            <summary>高级：改文件名 / 带 Referer、Cookie（内网系统常用）</summary>
+            <label for="wantname">落盘文件名（选填，多个链接时不用）</label>
+            <input id="wantname" type="text" spellcheck="false" autocomplete="off" placeholder="report-2026.pdf">
+            <div class="grid2">
+              <div>
+                <label for="referer">Referer（选填）</label>
+                <input id="referer" type="text" spellcheck="false" autocomplete="off" placeholder="https://内部系统/下载页">
+              </div>
+              <div>
+                <label for="cookie">Cookie（选填，只存在内存里，不写历史）</label>
+                <input id="cookie" type="text" spellcheck="false" autocomplete="off" placeholder="session=...">
+              </div>
+            </div>
+            <label for="authorization">Authorization（选填）</label>
+            <input id="authorization" type="text" spellcheck="false" autocomplete="off" placeholder="Bearer ...">
+            <label class="checkline"><input type="checkbox" id="forcehtml"> 链接返回的是网页也照样下（默认会拦下来，防止把登录页存成 .exe）</label>
+          </details>
+
+          <label>方式</label>
+          <div class="row modes">
+            <label><input type="radio" name="mode" value="auto" checked> 自动</label>
+            <label><input type="radio" name="mode" value="file"> 只当文件下</label>
+            <label><input type="radio" name="mode" value="clone"> 强制 git clone</label>
+            <label class="right"><input type="checkbox" id="chk-verify" checked> 下完做校验</label>
+          </div>
+
+          <div class="row actions">
+            <button id="btn-go" class="primary">开始下载</button>
+            <span id="gohint" class="muted">Ctrl+Enter 也可以启动。同名文件会自动加 (2)，不覆盖你已有的。</span>
+          </div>
+
+          <div class="tips">
+            <span><b>GitHub</b> 自动选加速源，某个源失效会换下一个</span>
+            <span><b>非 GitHub</b> 默认直连；内网下载可展开「高级」填 Cookie / Referer</span>
+            <span><b>批量</b> 一行一个，最多 50 条，同名不覆盖</span>
+          </div>
+        </section>
+
+        <!-- ② 转换 -->
+        <section class="card fx-in" id="sec-convert" style="--d:.08s">
+          <h2>转换 <span class="muted">图片 / PDF / Office / 音视频</span></h2>
+
+          <label for="cfiles">要转换的文件（一行一个；点「选文件…」可以多选）</label>
+          <textarea id="cfiles" rows="3" spellcheck="false" autocomplete="off"
+                    placeholder="D:\图片\照片.heic&#10;D:\文档\报告.docx"></textarea>
+          <div class="row">
+            <button id="btn-cpick" class="ghost">选文件…</button>
+            <button id="btn-cdetect" class="ghost">识别格式</button>
+            <button id="btn-cclear" class="ghost">清空</button>
+          </div>
+          <div id="cformat-hint" class="muted hintline">选好文件后这里会列出能转的格式</div>
+
+          <label for="ctarget">转成</label>
+          <div class="row">
+            <select id="ctarget"><option value="">先选文件…</option></select>
+            <span id="ctarget-hint" class="muted"></span>
+          </div>
+
+          <div id="copts" class="opts hidden">
+            <label class="opt" data-opt="quality">质量
+              <input id="cq" type="range" min="1" max="100" value="90">
+              <b id="cqv">90</b>
+            </label>
+            <label class="opt" data-opt="ico_sizes">图标尺寸
+              <select id="cicosize">
+                <option value="">多尺寸（16–256）</option>
+                <option value="256">256 × 256</option>
+                <option value="128">128 × 128</option>
+                <option value="64">64 × 64</option>
+                <option value="48">48 × 48</option>
+                <option value="32">32 × 32</option>
+                <option value="16">16 × 16</option>
+              </select>
+            </label>
+            <label class="opt" data-opt="dpi">DPI
+              <select id="cdpi">
+                <option value="72">72</option><option value="96">96</option>
+                <option value="150" selected>150</option><option value="300">300</option>
+                <option value="600">600</option>
+              </select>
+            </label>
+            <label class="opt" data-opt="pages">页码
+              <input id="cpages" type="text" placeholder="1-3,5（空=全部）">
+            </label>
+            <label class="opt" data-opt="rotate">旋转
+              <select id="crotate"><option value="90">90°</option><option value="180">180°</option><option value="270">270°</option></select>
+            </label>
+            <label class="opt" data-opt="password">密码
+              <input id="cpassword" type="text" placeholder="加密/解密用">
+            </label>
+          </div>
+
+          <label for="cdestdir">输出目录</label>
+          <div class="row">
+            <input id="cdestdir" type="text" spellcheck="false" autocomplete="off" placeholder="D:\转换结果">
+            <button id="btn-cbrowse" class="ghost">浏览…</button>
+          </div>
+          <div id="cdirpick" class="dirpick hidden"></div>
+
+          <div class="row actions">
+            <button id="btn-convert" class="primary">开始转换</button>
+            <span id="chint" class="muted">同名文件自动加 (2)，不覆盖。</span>
+          </div>
+
+          <div id="engines" class="engines"></div>
+        </section>
+      </div>
+
+      <!-- ③ 任务 -->
+      <section class="card fx-in" id="sec-tasks" style="--d:.14s">
+        <h2>任务 <span id="taskcount" class="muted"></span></h2>
+        <div id="tasks" class="tasks"><div class="muted empty">还没有任务。粘贴一个链接按开始下载，或者选文件去转换。</div></div>
+      </section>
+
+      <!-- ④ 校验已经在本地的文件 -->
+      <section class="card fx-in" id="sec-verify" style="--d:.20s">
+        <h2>校验本地文件 <span class="muted">不下载，只查这个文件本身完不完整</span></h2>
+        <label for="vpath">文件路径</label>
+        <div class="row">
+          <input id="vpath" type="text" spellcheck="false" autocomplete="off"
+                 placeholder="D:\Downloads\tabby-1.0.237-setup-x64.exe">
+          <button id="btn-vbrowse" class="ghost">选文件…</button>
+        </div>
+        <div id="vpick" class="dirpick hidden"></div>
+        <label for="vurl">这个文件自己的下载链接（选填。填了会去同一个 release 找作者公布的校验值比对；填发布页地址没用，要右键复制那种指向具体文件的链接）</label>
+        <div class="row">
+          <input id="vurl" type="text" spellcheck="false" autocomplete="off"
+                 placeholder="https://github.com/作者/仓库/releases/download/版本/文件名">
+        </div>
+        <div class="row actions">
+          <button id="btn-verify" class="primary">开始校验</button>
+          <span id="vhint" class="muted">结果出现在上面的任务列表里；几 GB 的文件要等几十秒，期间可以取消。</span>
+        </div>
+      </section>
+
+      <!-- ⑤ 代理 -->
+      <section class="card fx-in" id="sec-proxy" style="--d:.26s">
+        <h2>代理源
+          <button id="btn-probe" class="mini">全部测速</button>
+          <span id="probeout" class="muted"></span>
+        </h2>
+        <div class="tbl-wrap">
+          <table class="tbl">
+            <thead><tr><th>序</th><th>用</th><th>名称</th><th>前缀（拼在完整地址前面）</th><th>最近测速</th><th>成功/尝试</th><th></th></tr></thead>
+            <tbody id="proxy-body"></tbody>
+          </table>
+        </div>
+        <div class="row addrow">
+          <input id="px-name" type="text" placeholder="名称，如 my-proxy" class="small">
+          <input id="px-prefix" type="text" placeholder="前缀，如 https://my-proxy.example/（只填域名也行）">
+          <button id="btn-px-add" class="ghost">添加</button>
+        </div>
+        <div class="netrow">
+          <label class="checkline"><input type="checkbox" id="chk-extproxy"> 非 GitHub 链接也走上面的加速源（默认只直连）</label>
+          <input id="proxyurl" type="text" spellcheck="false" autocomplete="off"
+                 placeholder="公司/系统代理，如 http://127.0.0.1:7890（留空=不走）">
+          <button id="btn-save-net" class="ghost">保存网络设置</button>
+          <span id="nethint" class="muted"></span>
+        </div>
+        <p class="muted tight">
+          这些站子经常换，测速列一片红就说明该更新列表了。想自己搭一个稳定源（Cloudflare Workers，免费额度够用），
+          看 README 最后一节。
+        </p>
+      </section>
+
+      <!-- ⑥ 历史 -->
+      <section class="card fx-in" id="sec-hist" style="--d:.32s">
+        <h2>历史 <span id="histcount" class="muted"></span></h2>
+        <div class="tbl-wrap">
+          <table class="tbl">
+            <thead><tr><th>时间</th><th>文件</th><th>大小</th><th>速度</th><th>源</th><th>校验</th><th></th></tr></thead>
+            <tbody id="hist-body"></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+
+    <footer class="muted">
+      只监听 127.0.0.1，配置和历史都在本目录 data/ 里，删掉 <code>githubDownload</code> 文件夹就是彻底卸载，不留东西。
+    </footer>
   </div>
-</header>
-
-<div id="banner" class="banner hidden"></div>
-
-<main>
-  <!-- ① 下东西 -->
-  <section class="card fx-in" id="sec-new" style="--d:.02s">
-    <h2>下载</h2>
-
-    <label for="url">GitHub 链接（release 文件 / raw 单文件 / 整仓 zip / 仓库页 / 已带代理的加速链接都认）</label>
-    <div class="row">
-      <input id="url" type="text" spellcheck="false" autocomplete="off"
-             placeholder="https://github.com/Eugeny/tabby/releases/download/v1.0.237/tabby-1.0.237-setup-x64.exe">
-      <button id="btn-assets" class="ghost" title="贴的是 /releases 发布页时，列出它下面的文件让你点">列出该页文件</button>
-    </div>
-    <div id="assetbox" class="assetbox hidden"></div>
-
-    <label for="destdir">下载目录</label>
-    <div class="row">
-      <input id="destdir" type="text" spellcheck="false" autocomplete="off" placeholder="D:\Downloads">
-      <button id="btn-browse" class="ghost">浏览…</button>
-    </div>
-    <div id="dirpick" class="dirpick hidden"></div>
-    <div id="quickdirs" class="chips"></div>
-
-    <label>方式</label>
-    <div class="row modes">
-      <label><input type="radio" name="mode" value="auto" checked> 自动</label>
-      <label><input type="radio" name="mode" value="file"> 只当文件下</label>
-      <label><input type="radio" name="mode" value="clone"> 强制 git clone</label>
-      <label class="right"><input type="checkbox" id="chk-verify" checked> 下完做校验</label>
-    </div>
-
-    <div class="row actions">
-      <button id="btn-go" class="primary">开始下载</button>
-      <span id="gohint" class="muted">Ctrl+Enter 也可以启动。同名文件会自动加 (2)，不覆盖你已有的。</span>
-    </div>
-  </section>
-
-  <!-- ② 任务 -->
-  <section class="card fx-in" id="sec-tasks" style="--d:.09s">
-    <h2>任务 <span id="taskcount" class="muted"></span></h2>
-    <div id="tasks" class="tasks"><div class="muted empty">还没有任务。粘贴一个链接，按开始下载。</div></div>
-  </section>
-
-  <!-- ②b 校验已经在本地的文件 -->
-  <section class="card fx-in" id="sec-verify" style="--d:.16s">
-    <h2>校验本地文件 <span class="muted">不下载，只查这个文件本身完不完整</span></h2>
-    <label for="vpath">文件路径</label>
-    <div class="row">
-      <input id="vpath" type="text" spellcheck="false" autocomplete="off"
-             placeholder="D:\Downloads\tabby-1.0.237-setup-x64.exe">
-      <button id="btn-vbrowse" class="ghost">选文件…</button>
-    </div>
-    <div id="vpick" class="dirpick hidden"></div>
-    <label for="vurl">这个文件自己的下载链接（选填。填了会去同一个 release 找作者公布的校验值比对；填发布页地址没用，要右键复制那种指向具体文件的链接）</label>
-    <div class="row">
-      <input id="vurl" type="text" spellcheck="false" autocomplete="off"
-             placeholder="https://github.com/作者/仓库/releases/download/版本/文件名">
-    </div>
-    <div class="row actions">
-      <button id="btn-verify" class="primary">开始校验</button>
-      <span id="vhint" class="muted">结果出现在上面的任务列表里；几 GB 的文件要等几十秒，期间可以取消。</span>
-    </div>
-  </section>
-
-  <!-- ③ 代理 -->
-  <section class="card fx-in" id="sec-proxy" style="--d:.23s">
-    <h2>代理源
-      <button id="btn-probe" class="mini">全部测速</button>
-      <span id="probeout" class="muted"></span>
-    </h2>
-    <table class="tbl">
-      <thead><tr><th>序</th><th>用</th><th>名称</th><th>前缀（拼在完整地址前面）</th><th>最近测速</th><th>成功/尝试</th><th></th></tr></thead>
-      <tbody id="proxy-body"></tbody>
-    </table>
-    <div class="row addrow">
-      <input id="px-name" type="text" placeholder="名称，如 my-proxy" class="small">
-      <input id="px-prefix" type="text" placeholder="前缀，如 https://my-proxy.example/ （只填域名也行）">
-      <button id="btn-px-add" class="ghost">添加</button>
-    </div>
-    <p class="muted tight">
-      这些站子经常换，测速列一片红就说明该更新列表了。想自己搭一个稳定源（Cloudflare Workers，免费额度够用），
-      看 README 最后一节。
-    </p>
-  </section>
-
-  <!-- ④ 历史 -->
-  <section class="card fx-in" id="sec-hist" style="--d:.30s">
-    <h2>历史 <span id="histcount" class="muted"></span></h2>
-    <table class="tbl">
-      <thead><tr><th>时间</th><th>文件</th><th>大小</th><th>速度</th><th>源</th><th>校验</th><th></th></tr></thead>
-      <tbody id="hist-body"></tbody>
-    </table>
-  </section>
-</main>
-
-<footer class="muted">
-  只监听 127.0.0.1，配置和历史都在本目录 data/ 里，删掉 <code>githubDownload</code> 文件夹就是彻底卸载，不留东西。
-</footer>
+</div>
 
 <script src="/static/app.js"></script>
 </body>

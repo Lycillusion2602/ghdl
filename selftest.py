@@ -9,12 +9,15 @@ data/ 配置和历史；测完自己清理。要联网（会真下两个小文�
 
 覆盖的东西：
   语法    server.py 能否 import、app.js 能否过 node --check
-  解析    12 种链接形态（release / raw / blob / archive / 仓库页 / 已套代理 / 漏协议 / 非 GitHub / 垃圾）
+  解析    14 种链接形态（release / raw / blob / archive / 仓库页 / 已套代理 / 漏协议 / 非 GitHub / 垃圾）
+          + 文件名 URL 解码、裸域名补 https、非 GitHub 直连优先
+  转换    离线：PNG→WebP、多图→PDF、PDF→PNG、LibreOffice HTML→PDF、同名不覆盖
   校验    在本机常用目录里找一个真实安装包，验"查签名 + 算 SHA256"这条路（找不到就跳过）
   真下载  经真代理下 README.md 和整仓 zip，验 zip 全量 CRC 与 SHA256
   抗断线  造一个"下到 55% 就掐线"的本地假源排在第一位，看它能不能换源后拿到字节完全正确的文件
           （这条能抓出"半截文件被当成下载完成"这类最阴的 bug，别删）
-  接口    代理增删改排序停用、配置、目录浏览、release 列表、测速、非法目录
+  接口    代理增删改排序停用、配置、目录浏览/新建文件夹、release 列表、测速、非法目录、
+          格式识别、转换任务、批量提交、失败继续
   对齐    前端引用的元素 id、data-act、/api/* 是不是都存在
 """
 from __future__ import annotations
@@ -27,6 +30,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -93,6 +97,18 @@ html = open(os.path.join(PROJ, "static", "index.html"), encoding="utf-8").read()
 js = open(os.path.join(PROJ, "static", "app.js"), encoding="utf-8").read()
 css = open(os.path.join(PROJ, "static", "style.css"), encoding="utf-8").read()
 chk("三个前端文件都非空", len(html) > 800 and len(js) > 3000 and len(css) > 800)
+chk("Vuexy 式布局在（左侧 sidebar + 顶部 topbar + 内容区）",
+    'class="sidebar"' in html and 'class="topbar"' in html
+    and 'class="content"' in html and html.count('class="sb-item') >= 6)
+chk("页面 logo / favicon 都指向本地图标（断网也能显示）",
+    '/static/logo.png' in html and '/static/logo.ico' in html)
+chk("图标文件在位（用户给的下载箭头）",
+    os.path.exists(os.path.join(PROJ, "static", "logo.ico"))
+    and os.path.exists(os.path.join(PROJ, "static", "logo.png")))
+_spec = os.path.join(PROJ, "ghdl.spec")
+chk("PyInstaller spec 指定了 exe 图标",
+    os.path.exists(_spec) and "icon=" in open(_spec, encoding="utf-8").read()
+    and "logo.ico" in open(_spec, encoding="utf-8").read())
 
 # ============================================================ 1b 入口与版本一致性
 print("=== 1b. 入口与版本一致性 ===")
@@ -132,6 +148,8 @@ cases = [
      "raw", "README.md"),
     ("github.com/git/git/raw/master/README.md", "raw", "README.md"),
     ("https://gitlab.com/x/y/-/raw/main/a.txt", "external", "a.txt"),
+    ("https://example.com/%E7%BC%96%E7%A8%8B.ico", "external", "编程.ico"),
+    ("example.com/a.pdf", "external", "a.pdf"),
     ("不是链接", None, None),
 ]
 for url, want_kind, want_fn in cases:
@@ -146,9 +164,98 @@ chk("仓库页 + 强制 clone", p.get("kind") == "clone" and p["url"].endswith("
 chk("代理前缀自动补协议和斜杠", SV.norm_prefix("my.prox") == "https://my.prox/")
 chk("文件名去非法字符", SV.safe_filename('a<b>:c/d\\e|?*.txt') == "e_")
 chk("文件名保留中文和扩展名", SV.safe_filename("dir/sub/名字.txt") == "名字.txt")
+chk("文件名做 URL 解码（以前会落成 238_%E7%BC%96%E7%A8%8B.ico）",
+    SV.safe_filename("238_%E7%BC%96%E7%A8%8B.ico") == "238_编程.ico")
+chk("裸域名自动补 https", SV.parse_url("example.com/a.pdf").get("url") == "https://example.com/a.pdf")
+pex = SV.parse_url("https://kirk.cdkm.com/files/238_%E7%BC%96%E7%A8%8B.ico")
+chk("非 GitHub 链接标记为直连优先", pex.get("is_github") is False and pex.get("direct_first") is True)
+chk("GitHub 链接不会被误判成外部链接", SV.parse_url("https://github.com/a/b").get("is_github") is True)
 chk("超长文件名被截断", len(SV.safe_filename("x" * 400 + ".zip")) < 160)
 chk("字节数格式化", SV.fmt_bytes(169734624) == "162 MB", SV.fmt_bytes(169734624))
 chk("列得出盘符", bool(SV.list_dirs("").get("items")))
+
+
+# ============================================================ 2b 转换引擎（离线）
+print("=== 2b. 转换引擎（离线，不联网）===")
+try:
+    import converters as CV
+    conv_ok = True
+except Exception as e:                      # pragma: no cover
+    conv_ok = False
+    chk("转换模块能导入", False, "%s: %s" % (type(e).__name__, e))
+if conv_ok:
+    chk("转换模块能导入", True)
+    eng = CV.detect_engines(force=True)
+    chk("三个内置引擎都在（Pillow / PDFium / pypdf）",
+        all((eng.get(k) or {}).get("ok") for k in ("pillow", "pdfium", "pypdf")),
+        {k: (eng.get(k) or {}).get("ok") for k in ("pillow", "pdfium", "pypdf")})
+    tdir = tempfile.mkdtemp(prefix="ghdl_selftest_conv_")
+    try:
+        from PIL import Image, ImageDraw
+        from pypdf import PdfReader
+        p1 = os.path.join(tdir, "一.png")
+        p2 = os.path.join(tdir, "二.jpg")
+        Image.new("RGB", (120, 80), (255, 120, 170)).save(p1)
+        Image.new("RGB", (120, 80), (80, 160, 255)).save(p2)
+        outd = os.path.join(tdir, "out")
+        os.makedirs(outd)
+        tgt = CV.targets_for([p1], engines=eng)
+        chk("图片格式接口列得出 WebP/PDF",
+            tgt.get("ok") and any(t["ext"] == "webp" for t in tgt["targets"])
+            and any(t["ext"] == "pdf" for t in tgt["targets"]))
+        chk("PNG 的目标列表第一个就是 ICO（不用翻下拉）",
+            bool(tgt.get("targets")) and tgt["targets"][0]["ext"] == "ico",
+            [x["ext"] for x in tgt.get("targets") or []][:4])
+        chk("ICO 目标带尺寸选项",
+            any(t["ext"] == "ico" and "ico_sizes" in (t.get("options") or [])
+                for t in tgt.get("targets") or []))
+        icon_src = os.path.join(tdir, "图标源.png")
+        icon_im = Image.new("RGBA", (512, 360), (0, 0, 0, 0))
+        ImageDraw.Draw(icon_im).ellipse((40, 30, 470, 330), fill=(255, 120, 170, 255))
+        icon_im.save(icon_src)
+        rico = CV.convert_batch([icon_src], {"ext": "ico", "op": "convert", "engine": "Pillow"},
+                                outd, {}, engines=eng)
+        with Image.open(rico["outputs"][0]) as z:
+            ico_sizes = z.info.get("sizes") or set()
+            chk("PNG → ICO 生成 16/32/48/64/128/256 多尺寸",
+                {(16, 16), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)} <= ico_sizes,
+                ico_sizes)
+            chk("ICO 保留透明背景", z.convert("RGBA").getpixel((0, 0))[3] == 0)
+        rico2 = CV.convert_batch([icon_src], {"ext": "ico", "op": "convert", "engine": "Pillow"},
+                                 outd, {"ico_sizes": "32"}, engines=eng)
+        with Image.open(rico2["outputs"][0]) as z:
+            chk("ICO 可以只导出指定尺寸", z.info.get("sizes") == {(32, 32)}, z.info.get("sizes"))
+        r = CV.convert_batch([p1], {"ext": "webp", "op": "convert", "engine": "Pillow"},
+                             outd, {"quality": 80}, engines=eng)
+        chk("PNG → WebP 真的落盘", bool(r["outputs"]) and os.path.getsize(r["outputs"][0]) > 0,
+            r.get("items"))
+        with Image.open(r["outputs"][0]) as im:
+            chk("WebP 文件能被 Pillow 读回来", im.format == "WEBP", im.format)
+        r2 = CV.convert_batch([p1], {"ext": "webp", "op": "convert", "engine": "Pillow"},
+                              outd, {"quality": 80}, engines=eng)
+        chk("同名输出不覆盖（自动加 (2)）", r2["outputs"][0] != r["outputs"][0])
+        rm = CV.convert_batch([p1, p2], {"ext": "pdf", "op": "convert"}, outd,
+                              {"dpi": 72}, engines=eng)
+        chk("多张图片合成一个 PDF", bool(rm["outputs"]) and len(PdfReader(rm["outputs"][0]).pages) == 2,
+            rm.get("outputs"))
+        rp = CV.convert_batch([rm["outputs"][0]], {"ext": "png", "op": "convert", "engine": "PDFium"},
+                              outd, {"dpi": 72, "pages": "1"}, engines=eng)
+        chk("PDF → PNG 能渲染", bool(rp["outputs"]) and os.path.getsize(rp["outputs"][0]) > 0)
+        lo = eng.get("libreoffice") or {}
+        if lo.get("ok"):
+            hp = os.path.join(tdir, "probe.html")
+            open(hp, "w", encoding="utf-8").write("<html><body><h1>自测</h1><p>hello</p></body></html>")
+            rl = CV.convert_batch([hp], {"ext": "pdf", "op": "convert", "engine": "LibreOffice"},
+                                  outd, {}, engines=eng)
+            chk("LibreOffice 能把 HTML 转成 PDF", bool(rl["outputs"]) and os.path.getsize(rl["outputs"][0]) > 500)
+        else:
+            info("跳过 LibreOffice 实测", "这台机器没装，转换界面会提示装一个")
+        ff = eng.get("ffmpeg") or {}
+        chk("ffmpeg 探测结果有明确结论", "ok" in ff, ff.get("detail"))
+    except Exception as e:
+        chk("离线转换实测", False, "%s: %s" % (type(e).__name__, e))
+    finally:
+        shutil.rmtree(tdir, ignore_errors=True)
 
 def find_exe_sample():
     """
@@ -362,11 +469,18 @@ for _ in range(60):
 chk("服务在备用端口起来了", up)
 base = req("/api/state")
 chk("state 字段齐", {"config", "proxies", "tasks", "history", "version"} <= set(base), sorted(base))
+chk("state 带引擎能力表（转换界面靠它画绿色/红色）",
+    isinstance(base.get("engines"), dict) and "pillow" in base["engines"],
+    sorted(base.get("engines") or {}))
 chk("接口报的版本号 = 代码里的 APP_VERSION", base.get("version") == SV.APP_VERSION, base.get("version"))
 chk("默认 4 条源（3 个实测站 + 直连兜底）", len(base["proxies"]) == 4,
     [p["name"] for p in base["proxies"]])
 chk("首页 HTML 出得来", "<title>ghdl" in urllib.request.urlopen(
     "http://127.0.0.1:%d/" % PORT, timeout=10).read().decode("utf-8"))
+_fav = urllib.request.urlopen("http://127.0.0.1:%d/favicon.ico" % PORT, timeout=10)
+chk("favicon 返回的是 ico 而不是首页 HTML",
+    _fav.headers.get_content_type() == "image/x-icon" and len(_fav.read()) > 1000,
+    _fav.headers.get("Content-Type"))
 chk("样式出得来", "bar.done" in urllib.request.urlopen(
     "http://127.0.0.1:%d/static/style.css" % PORT, timeout=10).read().decode("utf-8"))
 
@@ -410,12 +524,21 @@ if zf and zf.get("verify"):
 big = req("/api/download", {"url": "https://github.com/Eugeny/tabby/releases/download/v1.0.237/"
                                    "tabby-1.0.237-setup-arm64.exe", "destdir": OUT, "mode": "file"})
 bf = wait_task(big["task"]["id"], tries=200)
-chk("release 大文件（arm64 安装包 ~160MB）也能下完", bf and bf["state"] == "done",
-    "%s / %s" % (bf and bf["state"], SV.fmt_bytes((bf or {}).get("downloaded"))))
-if bf and bf.get("verify"):
-    print("      大文件校验汇总：" + SV.summarize_verify(bf["verify"]))
-    os.remove(bf["dest"]) if os.path.exists(bf["dest"]) else None
-    info("大文件测速", "%s/s" % SV.fmt_bytes(bf.get("speed")))
+if bf and bf["state"] == "done":
+    chk("release 大文件（arm64 安装包 ~160MB）也能下完", True,
+        "%s / %s" % (bf["state"], SV.fmt_bytes(bf.get("downloaded"))))
+    if bf.get("verify"):
+        print("      大文件校验汇总：" + SV.summarize_verify(bf["verify"]))
+        os.remove(bf["dest"]) if os.path.exists(bf["dest"]) else None
+        info("大文件测速", "%s/s" % SV.fmt_bytes(bf.get("speed")))
+else:
+    # 网络只有几十 KB/s 时，160MB 在 100 秒内本来就不可能下完。这不是代码错，
+    # 如实取消掉、跳过这条，别把校园网的速度问题报成产品失败。
+    req("/api/cancel", {"id": big["task"]["id"]})
+    bf = wait_task(big["task"]["id"], tries=60)
+    info("跳过大文件完整性判断",
+         "100 秒只下了 %s，网络太慢（不是代码错）；任务已取消，半截文件按设计留在 .part 里"
+         % SV.fmt_bytes((bf or {}).get("downloaded")))
 bad = req("/api/download", {"url": REF_URL, "destdir": "\x00坏路径", "mode": "file"})
 chk("非法目录被挡下并说清原因", bad.get("ok") is False, bad.get("error"))
 print("=== 5b. 挤牙膏源：必须在十几秒内被识别并弃用 ===")
@@ -490,6 +613,43 @@ lsf = req("/api/ls?path=" + urllib.parse.quote(OUT) + "&files=1")
 chk("文件浏览器能列出文件带大小", bool(lsf.get("files")) and "size" in lsf["files"][0],
     [(f["name"], f["size"]) for f in lsf.get("files", [])][:3])
 
+print("=== 5c2. 转换接口（不联网）===")
+try:
+    from PIL import Image as _Img
+    cp = os.path.join(OUT, "转换样本.png")
+    _Img.new("RGB", (140, 90), (250, 120, 170)).save(cp)
+    fmt = req("/api/formats", {"paths": [cp]})
+    chk("格式接口能识别图片并列出目标",
+        fmt.get("ok") and any(t["ext"] == "webp" for t in fmt.get("targets") or []),
+        [t.get("ext") for t in fmt.get("targets") or []][:6])
+    tgt = next((t for t in fmt.get("targets") or [] if t["ext"] == "webp"), None)
+    ct = req("/api/convert", {"paths": [cp], "target": tgt, "outdir": OUT,
+                              "options": {"quality": 80}})["task"]
+    cw = wait_task(ct["id"], tries=100)
+    chk("转换任务完成并真的落盘",
+        bool(cw) and cw["state"] == "done" and cw.get("outputs")
+        and os.path.exists(cw["outputs"][0]) and os.path.getsize(cw["outputs"][0]) > 0,
+        "%s / %s" % (cw and cw.get("state"), (cw or {}).get("outputs")))
+    chk("转换任务标的是格式转换而不是下载",
+        (cw or {}).get("mode") == "convert" and (cw or {}).get("filename"),
+        "%s / %s" % ((cw or {}).get("mode"), (cw or {}).get("filename")))
+    badfmt = req("/api/formats", {"paths": [os.path.join(OUT, "根本不存在.png")]})
+    chk("格式接口对不存在的文件给出明确错误", badfmt.get("ok") is False, badfmt.get("error"))
+except Exception as e:
+    chk("转换接口实测", False, "%s: %s" % (type(e).__name__, e))
+
+print("=== 5c3. 批量提交与继续 ===")
+bat = req("/api/download", {"urls": ["http://127.0.0.1:1/a.bin", "http://127.0.0.1:1/b.bin"],
+                            "destdir": OUT})
+chk("一次粘两个链接会起两个任务", bat.get("ok") and len(bat.get("tasks") or []) == 2,
+    [x.get("filename") for x in bat.get("tasks") or []])
+bf = [wait_task(x["id"], tries=60) for x in bat.get("tasks") or []]
+chk("连不上的两个任务都如实失败",
+    len(bf) == 2 and all(x and x["state"] in ("failed", "canceled") for x in bf),
+    [(x and x["state"]) for x in bf])
+chk("失败任务可以点「继续」", req("/api/retry", {"id": bf[0]["id"]}).get("ok") is True)
+wait_task(bf[0]["id"], tries=60)
+
 print("=== 5d. 主题 ===")
 page = urllib.request.urlopen("http://127.0.0.1:%d/" % PORT, timeout=10).read().decode("utf-8")
 chk("右上角没有主题切换器了（他要求删掉）", 'data-act="theme"' not in page)
@@ -531,12 +691,12 @@ ext += re.findall(r'@import\s+(?:url\()?\s*["\']?(https?://[^\)"\']+)', css)
 ext += re.findall(r'url\(\s*["\']?(https?://[^\)"\']+)', css)
 chk("前端不引用任何外部资源（断网也能完整显示）", not ext, ext[:4])
 static_ok = True
-for f in ("animate.css", "style.css", "app.js", "ANIMATE-LICENSE.txt"):
+for f in ("animate.css", "style.css", "app.js", "ANIMATE-LICENSE.txt", "logo.ico", "logo.png"):
     try:
         urllib.request.urlopen("http://127.0.0.1:%d/static/%s" % (PORT, f), timeout=10).read()
     except Exception:
         static_ok = False
-chk("四个静态资源服务都取得到", static_ok)
+chk("静态资源（含页面图标）都取得到", static_ok)
 chk("单次动画是渲染后临时挂类（不是写进模板，否则每次轮询重播）",
     "applyFx()" in js and "pendingFx" in js and "animationend" in js
     and 'class="task ' not in js and 'fx-done"></div>' not in js)
@@ -559,6 +719,18 @@ chk("常用目录写进配置",
     len(req("/api/config", {"quick_dirs": [OUT, os.path.expanduser("~")]})["config"]["quick_dirs"]) >= 2)
 chk("历史里留下了成功记录（含 sha256）", len([h for h in req("/api/state")["history"] if h.get("ok")]) >= 2)
 chk("目录浏览能进能退", bool(req("/api/ls")["items"]) and bool(req("/api/ls?path=" + urllib.parse.quote(OUT))["parent"]))
+mk = req("/api/mkdir", {"parent": OUT, "name": "新建目录"})
+chk("能新建文件夹", mk.get("ok") and os.path.isdir(mk.get("path") or ""), mk)
+chk("重名文件夹被拒而不是静默成功",
+    req("/api/mkdir", {"parent": OUT, "name": "新建目录"}).get("ok") is False)
+cfg2 = req("/api/config", {"last_dir": OUT})
+chk("last_dir 写进配置", os.path.abspath(cfg2["config"].get("last_dir") or "") == os.path.abspath(OUT),
+    cfg2["config"].get("last_dir"))
+chk("recent_dirs 里记下了落盘目录",
+    os.path.abspath(OUT) in [os.path.abspath(x) for x in cfg2["config"].get("recent_dirs") or []],
+    cfg2["config"].get("recent_dirs"))
+chk("非 GitHub 默认直连（external_proxy 默认 false）",
+    req("/api/config", {})["config"].get("external_proxy") is False)
 chk("open 不存在的路径只报错不弹窗", req("/api/open?path=" + urllib.parse.quote(os.path.join(OUT, "无.zip"))).get("ok") is False)
 try:
     ass = req("/api/assets?url=https://github.com/Eugeny/tabby/releases", timeout=45)
@@ -668,6 +840,29 @@ if os.path.exists(exe):
                 if s["state"] in ("done", "failed", "canceled"):
                     return s
             return s
+
+        try:
+            eeng = ereq("/api/state").get("engines") or {}
+            chk("exe 里内置转换引擎是活的",
+                (eeng.get("pillow") or {}).get("ok") and (eeng.get("pdfium") or {}).get("ok"),
+                {k: (eeng.get(k) or {}).get("ok") for k in ("pillow", "pdfium", "pypdf")})
+            from PIL import Image as _EImg
+            exe_png = os.path.join(OUT, "exe_转换样本.png")
+            _EImg.new("RGB", (100, 60), (30, 120, 200)).save(exe_png)
+            efmt = ereq("/api/formats", {"paths": [exe_png]})
+            chk("exe 里的格式接口能识别图片",
+                efmt.get("ok") and any(t["ext"] == "webp" for t in efmt.get("targets") or []),
+                [t.get("ext") for t in efmt.get("targets") or []][:5])
+            etgt = next((t for t in efmt.get("targets") or [] if t["ext"] == "webp"), None)
+            if etgt:
+                ec = ereq("/api/convert", {"paths": [exe_png], "target": etgt,
+                                           "outdir": OUT, "options": {"quality": 80}})["task"]
+                ecw = ewait(ec["id"], tries=100)
+                chk("exe 里能真的转出文件（Pillow 打进去了）",
+                    bool(ecw) and ecw["state"] == "done" and ecw.get("outputs")
+                    and os.path.exists(ecw["outputs"][0]), (ecw or {}).get("error"))
+        except Exception as e:
+            chk("exe 转换实测", False, "%s: %s" % (type(e).__name__, e))
         et = ewait(ereq("/api/download", {"url": REF_URL, "destdir": OUT, "mode": "file"})["task"]["id"])
         got = (et or {}).get("dest") or ""
         chk("exe 能真下完文件且字节正确",

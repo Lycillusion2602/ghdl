@@ -35,6 +35,13 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
+try:
+    import converters as CONV
+    CONV_ERR = None
+except Exception as _e:                      # 转换依赖缺了也不该让下载器起不来
+    CONV = None
+    CONV_ERR = "%s: %s" % (type(_e).__name__, _e)
+
 # 控制台是 GBK，遇到编码不了的字符（箭头之类）用 ? 顶上，别让 print 抛异常把服务搞崩。
 # 注意：打包成 --windowed 的 exe 后 sys.stdout / sys.stderr 直接是 None，所以这里要判空。
 for _s in (sys.stdout, sys.stderr):
@@ -55,8 +62,8 @@ def say(msg):
 
 FROZEN = bool(getattr(sys, "frozen", False))          # PyInstaller 打包后为 True
 # 版本号的唯一出处。发版流程：改这一行 → commit → 打同名 tag（去掉 v）→ CI 会比对，
-# 不一致就直接失败不出包，避免"tag 说 1.2.0、界面里写 1.1.0"这种事。
-APP_VERSION = "1.1.0"
+# 不一致就直接失败不出包，避免"tag 说 1.2.2、界面里写 1.2.1"这种事。
+APP_VERSION = "1.2.2"
 # 打包后 __file__ 指向临时解压目录（_MEIxxxxxx，每次运行都换、退出就没了）。
 # 若还用它的目录当 BASE，data/ 会被写进临时目录里 —— 配置和历史每次都丢。
 # 所以：可写数据一律放 exe 旁边；只读的 static 优先用 exe 旁边的（方便他改样式），
@@ -77,6 +84,7 @@ LOG_F = os.path.join(DATA, "server.log")
 PROBE_TARGET = "https://github.com/octocat/Hello-World/raw/master/README"
 CURL = "curl.exe"
 DEVNULL = "NUL"
+_WIN = os.name == "nt"
 
 DEFAULT_PROXIES = {
     "_说明": "prefix 后面直接拼完整的 https 地址；enabled=false 的不参与尝试；order 小的先试",
@@ -87,7 +95,7 @@ DEFAULT_PROXIES = {
          "enabled": True, "order": 2, "last_ms": None, "last_ok": None, "tried": 0, "ok": 0, "last_at": None},
         {"id": "ghpnet", "name": "ghproxy.net", "prefix": "https://ghproxy.net/",
          "enabled": True, "order": 3, "last_ms": None, "last_ok": None, "tried": 0, "ok": 0, "last_at": None},
-        {"id": "direct", "name": "直连 GitHub（兜底，通常很慢）", "prefix": "",
+        {"id": "direct", "name": "直连（不走加速）", "prefix": "",
          "enabled": True, "order": 99, "last_ms": None, "last_ok": None, "tried": 0, "ok": 0, "last_at": None},
     ],
 }
@@ -96,10 +104,18 @@ DEFAULT_CONFIG = {
     "port": 8765,
     "default_dir": "",            # 留空 = 自动用 ~/Downloads，见 default_downloads_dir()
     "quick_dirs": [],              # 常用目录快捷按钮；首次运行后你可以在界面里加自己的（存进 config.json）
+    "last_dir": "",                # 上次真正下载到哪；下次打开页面默认就填它
+    "recent_dirs": [],             # 最近用过的目录，最多 8 条
     "speed_floor_bps": 2048,      # 连续 speed_floor_secs 秒低于这个速度 → 判定这个源卡死，换下一个
     "speed_floor_secs": 20,       # 实测：连上却一直不回数据的源（多是直连 raw.githubusercontent.com）靠这条才不至于干等
     "stall_secs": 30,             # 连续 30 秒文件字节没增长就判这个源卡死（TLS 握手 / CRL 查询卡住时 curl 自己的超时管不到）
     "attempt_cap_secs": 600,      # 单次尝试的绝对上限，防病态挂死
+    "max_concurrent": 3,          # 同时下载/转换几个；批量粘贴时其余排队
+    "proxy_url": "",              # 可选：给 curl 用的系统/公司代理，如 http://127.0.0.1:7890
+    "external_proxy": False,      # 非 GitHub 链接是否也走下面那串 GitHub 加速源（默认直连）
+    "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "engines": {},                # 手动指定的引擎路径，如 {"libreoffice": "...soffice.exe"}
     "verify": True,
 }
 
@@ -107,11 +123,31 @@ LOCK = threading.RLock()
 TASKS: dict = {}
 STARTED_AT = time.time()
 SERVER = None                    # main() 里赋成 httpd，界面点「停止服务」时要它收尾
-BUSY_STATES = ("queued", "parsing", "probing", "downloading", "verify", "need_asset")
+BUSY_STATES = ("queued", "parsing", "probing", "downloading", "verify",
+               "converting", "installing", "need_asset")
+SEM = threading.BoundedSemaphore(3)   # 并发上限；main() 里按配置重建
+DIALOG_LOCK = threading.Lock()        # 同一时间只弹一个系统选择框
 
 
 def hard_exit():
     """给自己半秒把响应发回去，然后退出。exe 没有控制台窗口，界面里必须留这么个出口。"""
+    # os._exit 不会替我们收子进程：先把还在跑的 curl 停掉，否则它们会变成孤儿，
+    # 继续往 .part 里写（下一次自测就会看到莫名其妙的 (2) 和抢带宽）。
+    try:
+        if CONV is not None:
+            CONV.kill_all()
+    except Exception:
+        pass
+    try:
+        with LOCK:
+            tasks = list(TASKS.values())
+        for t in tasks:
+            t["cancel"] = True
+            p = t.get("proc")
+            if p is not None:
+                reap(p)
+    except Exception:
+        pass
     try:
         if SERVER:
             SERVER.shutdown()
@@ -229,8 +265,11 @@ def expand_path(path):
 
 
 def safe_filename(name, fallback="download.bin"):
-    """去掉查询串和 Windows 非法字符；太长就截断主体保留扩展名。"""
-    name = (name or "").strip().strip('"')
+    """去掉查询串和 Windows 非法字符；太长就截断主体保留扩展名。
+    先做 URL 解码：有些站点把中文名写成 %E7%BC%96%E7%A8%8B.ico，
+    以前会原样落盘成乱码名。
+    """
+    name = unquote(str(name or "")).strip().strip('"')
     name = name.split("?")[0].split("#")[0]
     name = os.path.basename(name.replace("\\", "/"))
     name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip(" .")
@@ -271,7 +310,7 @@ def strip_proxy_prefix(url):
 
 def parse_url(raw, mode="auto"):
     """
-    返回 plan：{ok, kind, url, filename, repo, tag, note}
+    返回 plan：{ok, kind, url, filename, repo, tag, note, is_github, host, direct_first}
     kind ∈ asset | raw | archive | repo_zip | clone | release_page | external | unknown
     """
     u = (raw or "").strip().strip('"').strip("'")
@@ -280,6 +319,8 @@ def parse_url(raw, mode="auto"):
     if not re.match(r"^https?://", u, re.I):
         if "github.com/" in u or "githubusercontent.com/" in u:
             u = "https://" + u.lstrip("/")
+        elif re.match(r"^[\w.-]+\.[a-z]{2,}(?::\d+)?(?:/|$)", u, re.I):
+            u = "https://" + u.lstrip("/")     # example.com/a.pdf 也认
         else:
             return {"ok": False, "error": "这不像 http(s) 链接：%s" % u[:60]}
     u, stripped = strip_proxy_prefix(u)
@@ -288,8 +329,12 @@ def parse_url(raw, mode="auto"):
     pr = urlparse(u)
     host = (pr.hostname or "").lower()
     segs = [s for s in pr.path.split("/") if s]
+    is_gh = (host in ("github.com", "www.github.com", "raw.githubusercontent.com",
+                      "codeload.github.com")
+             or host.endswith(".github.com") or host.endswith(".githubusercontent.com"))
     plan = {"ok": True, "kind": "unknown", "url": u, "filename": None,
-            "repo": None, "tag": None, "note": note}
+            "repo": None, "tag": None, "note": note,
+            "is_github": is_gh, "host": host, "direct_first": False}
 
     if host == "raw.githubusercontent.com":
         plan.update(kind="raw", filename=safe_filename(segs[-1] if segs else ""))
@@ -299,7 +344,7 @@ def parse_url(raw, mode="auto"):
         plan.update(kind="archive", filename=safe_filename(segs[-1] if segs else "", "archive.zip"))
         return plan
 
-    if host in ("github.com", "www.github.com"):
+    if host in ("github.com", "www.github.com") or host.endswith(".github.com"):
         # /owner/repo/releases/download/<tag>/<asset>
         if len(segs) >= 5 and segs[2] == "releases" and segs[3] == "download":
             o, r, tag = segs[0], segs[1], segs[4]
@@ -346,9 +391,18 @@ def parse_url(raw, mode="auto"):
             plan.update(kind="external", filename=safe_filename(segs[-1]))
             return plan
 
-    plan.update(kind="external",
-                filename=safe_filename(os.path.basename(pr.path) or "download.bin"),
-                note=(note + "；非 GitHub 链接，代理未必支持，先当普通下载处理").strip("；"))
+    # 非 GitHub：文件名先解码再取 basename（%E7%BC%96%E7%A8%8B.ico → 编程.ico），
+    # 拿不到名字也不要紧，下载前会用 Content-Disposition 补。
+    path_dec = unquote(pr.path or "")
+    fn = os.path.basename(path_dec) or "download.bin"
+    if fn in ("download.bin", "download", ""):
+        qs = parse_qs(pr.query or "")
+        for key in ("filename", "name", "file", "download"):
+            if qs.get(key) and qs[key][0].strip():
+                fn = qs[key][0].strip()
+                break
+    plan.update(kind="external", filename=safe_filename(fn), direct_first=True,
+                note=(note + "；非 GitHub 链接，直连优先（要套加速源可在设置里打开）").strip("；"))
     return plan
 
 
@@ -386,7 +440,8 @@ def probe_proxy(px):
     target = norm_prefix(px.get("prefix")) + PROBE_TARGET
     t0 = time.time()
     rc, out = curl(["-sS", "-L", "--fail", "--max-time", "12", "--connect-timeout", "8",
-                    "-o", DEVNULL, "-w", "%{http_code}|%{size_download}", target], timeout=20)
+                    "-o", DEVNULL, "-w", "%{http_code}|%{size_download}"] + proxy_args() + [target],
+                   timeout=20)
     ms = int((time.time() - t0) * 1000)
     code = size = 0
     tail = split_stats(out)
@@ -426,9 +481,20 @@ def probe_all():
                                       "err": "测速线程没返回"} for px in lst]
 
 
-def pick_order():
-    """启用中的代理排队：上次失败的排最后，其余按最近耗时升序，没测过的按手动顺序。"""
+def pick_order(plan=None):
+    """启用中的代理排队：上次失败的排最后，其余按最近耗时升序，没测过的按手动顺序。
+
+    非 GitHub 链接默认只走「直连」：gh-proxy 这类加速源本来就是给 GitHub 做的，
+    把 work 的内网/对象存储地址拼在它后面，等来的只会是 404/403，白白浪费十几秒。
+    """
     lst = [p for p in get_proxies() if p.get("enabled")]
+    cfg = get_config()
+    if plan is not None and not plan.get("is_github"):
+        direct = [p for p in lst if not (p.get("prefix") or "").strip()]
+        if not cfg.get("external_proxy"):
+            return direct or lst[:1]
+        others = [p for p in lst if (p.get("prefix") or "").strip()]
+        return direct + sorted(others, key=lambda p: (p.get("order") or 99))
 
     def key(p):
         ms = p.get("last_ms")
@@ -551,7 +617,7 @@ def official_checksum(plan, sha_hex):
         for c in cands:
             url = norm_prefix(px.get("prefix")) + base + "/" + c
             rc, out = curl(["-sS", "-L", "--max-time", "12", "--max-filesize", "2000000",
-                            "-w", "|CODE|%{http_code}", url], timeout=20)
+                            "-w", "|CODE|%{http_code}"] + proxy_args() + [url], timeout=20)
             tried += 1
             body, _, code_s = out.rpartition("|CODE|")
             try:
@@ -672,14 +738,103 @@ def header_filename(hdr_file):
     raw = header_value(hdr_file, "content-disposition")
     if not raw:
         return None
-    m = re.search(r'filename\*?\s*=\s*"?([^";]+)', raw)
+    m = re.search(r'filename\*?\s*=\s*"?([^";]+)', raw, re.I)
     if not m:
         return None
     name = m.group(1).strip().strip('"')
-    if name.startswith("UTF-8''"):
-        name = unquote(name[len("UTF-8''"):])
+    if name.upper().startswith("UTF-8''"):
+        name = unquote(name[7:])
     name = safe_filename(name)
     return name if name != "download.bin" else None
+
+
+def header_range_total(hdr_file):
+    """Range 请求（0-0）时总大小在 Content-Range 里，不在 Content-Length。"""
+    try:
+        with open(hdr_file, "r", encoding="utf-8", errors="replace") as f:
+            txt = f.read()
+    except OSError:
+        return None
+    m = re.search(r"(?im)^content-range:\s*bytes\s+\d+-\d+/(\d+)", txt)
+    return int(m.group(1)) if m else None
+
+
+def request_headers(plan, t=None):
+    """把配置里的 UA 和任务里的 Referer/Cookie/Authorization 拼成 curl -H 参数。
+    日志里绝不打印这些值 —— 它们经常是内网 token。"""
+    cfg = get_config()
+    t = t or {}
+    h = []
+    ua = (t.get("user_agent") or cfg.get("user_agent") or "").strip()
+    if ua:
+        h += ["-H", "User-Agent: " + ua]
+    for key, hname in (("referer", "Referer"), ("cookie", "Cookie"),
+                       ("authorization", "Authorization")):
+        v = (t.get(key) or "").strip()
+        if v and "\r" not in v and "\n" not in v:
+            h += ["-H", "%s: %s" % (hname, v)]
+    return h
+
+
+def proxy_args():
+    p = (get_config().get("proxy_url") or "").strip()
+    return ["--proxy", p] if p else []
+
+
+def probe_url(plan, t=None):
+    """
+    下载前做一次 HEAD 预检：
+      - 拿到真正的文件名（Content-Disposition，尤其 download?id=123 这种）
+      - 拿到总大小，进度条一开始就是准的
+      - 认出「这其实是个网页/登录页」，别把 HTML 存成 .exe
+    HEAD 不被支持时退回 Range: bytes=0-0，只取一个字节。失败就当没预检，不影响下载。
+    """
+    hdr = tempfile.mktemp(prefix="ghdl_head_", suffix=".hdr")
+    common = ["-sS", "-L", "--max-time", "15", "--connect-timeout", "8",
+              "-D", hdr, "-o", DEVNULL] + request_headers(plan, t) + proxy_args()
+    info = {"ok": False, "code": 0, "filename": None, "size": None,
+            "ctype": "", "html": False, "final_url": plan.get("url")}
+    try:
+        rc, out = curl(common + ["-I", "-w", "%{http_code}|%{url_effective}", plan["url"]],
+                       timeout=25)
+        code = 0
+        tail = split_stats(out)
+        if "|" in tail:
+            try:
+                code = int(tail.split("|")[0])
+            except ValueError:
+                code = 0
+        if rc != 0 or code in (0, 403, 405, 400, 501):
+            # 有些站（对象存储的预签名链接、内网系统）不认 HEAD，只认 GET
+            try:
+                os.unlink(hdr)
+            except OSError:
+                pass
+            rc, out = curl(common + ["-r", "0-0", "-w", "%{http_code}|%{url_effective}",
+                                     plan["url"]], timeout=25)
+            tail = split_stats(out)
+            if "|" in tail:
+                try:
+                    code = int(tail.split("|")[0])
+                except ValueError:
+                    code = 0
+        info["code"] = code
+        info["final_url"] = tail.split("|", 1)[1] if "|" in tail else plan.get("url")
+        info["filename"] = header_filename(hdr)
+        info["ctype"] = (header_value(hdr, "content-type") or "").split(";")[0].strip().lower()
+        size = header_range_total(hdr) or header_total(hdr)
+        info["size"] = size if size and size > 0 else None
+        info["html"] = info["ctype"] in ("text/html", "application/xhtml+xml")
+        info["ok"] = 200 <= code < 400
+        return info
+    except Exception as e:
+        info["error"] = str(e)
+        return info
+    finally:
+        try:
+            os.unlink(hdr)
+        except OSError:
+            pass
 
 
 def reap(proc):
@@ -716,7 +871,7 @@ def run_file_download(t, plan):
     cfg = get_config()
     dest = t["dest"]
     part = dest + ".part"
-    order = pick_order()
+    order = pick_order(plan)
     i = 0
     fresh_retried = set()
     while i < len(order):
@@ -750,6 +905,7 @@ def run_file_download(t, plan):
                 "--speed-time", str(int(cfg["speed_floor_secs"])),
                 "-D", hdr, "-o", part,
                 "-w", "%{http_code}|%{size_download}|%{speed_download}|%{time_total}"]
+        args += request_headers(plan, t) + proxy_args()
         if resume:
             args += ["-C", "-"]
         args.append(target)
@@ -769,6 +925,8 @@ def run_file_download(t, plan):
         try:
             proc = subprocess.Popen([CURL] + args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            with LOCK:
+                t["proc"] = proc
             while proc.poll() is None:
                 time.sleep(0.4)
                 try:
@@ -828,6 +986,8 @@ def run_file_download(t, plan):
                     proc.stdout.close()
                 except OSError:
                     pass
+            with LOCK:
+                t["proc"] = None
         if stalled:
             attempt.update(rc="stalled", bytes=0)
             mark(False, time.time() - started_ts)
@@ -945,6 +1105,9 @@ def run_clone(t, plan):
     with LOCK:
         t.update(dest=dest, filename=os.path.basename(dest))
     env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_LFS_SKIP_SMUDGE="1")
+    _px = (get_config().get("proxy_url") or "").strip()
+    if _px:
+        env.update(HTTP_PROXY=_px, HTTPS_PROXY=_px, ALL_PROXY=_px)
     for px in pick_order():
         prefix = norm_prefix(px.get("prefix"))
         if not prefix:
@@ -961,6 +1124,8 @@ def run_clone(t, plan):
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                     text=True, encoding="utf-8", errors="replace", env=env,
                                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            with LOCK:
+                t["proc"] = proc
         except OSError as e:
             task_log(t, "启动 git 失败：%s" % e)
             return False
@@ -996,6 +1161,8 @@ def run_clone(t, plan):
             out = (proc.stdout.read() if proc.stdout else "") or ""
         except (OSError, ValueError):
             out = ""
+        with LOCK:
+            t["proc"] = None
         attempt.update(rc=proc.returncode, bytes=t.get("downloaded") or 0)
         if proc.returncode == 0:
             with LOCK:
@@ -1082,13 +1249,33 @@ def start_verify_task(fpath, src_url=""):
 def run_task(tid):
     t = TASKS[tid]
     dest = ""
+    held = False
     try:
         if t.get("mode") == "verify":
             do_verify_task(t)
             return
+        if t.get("mode") == "convert":
+            run_convert_task(t)
+            return
+        if t.get("mode") == "install":
+            run_install_task(t)
+            return
+
+        # 并发闸门：批量粘 10 个链接时，其余任务老老实实排队，
+        # 不要 10 个 curl 一起抢带宽把每个都拖成龟速。
+        SEM.acquire()
+        held = True
         with LOCK:
             t["state"] = "parsing"
-        plan = parse_url(t["url"], t.get("mode") or "auto")
+        reuse = bool(t.get("reuse") and t.get("plan") and t.get("dest"))
+        if reuse:
+            plan = dict(t["plan"])
+            plan["ok"] = True
+            if not plan.get("url"):
+                plan = parse_url(t["url"], t.get("mode") or "auto")
+            task_log(t, "沿用上次的落点继续：%s" % t.get("dest"))
+        else:
+            plan = parse_url(t["url"], t.get("mode") or "auto")
         if not plan.get("ok"):
             raise ValueError(plan.get("error") or "链接解析失败")
         if plan["kind"] == "release_page":
@@ -1098,10 +1285,42 @@ def run_task(tid):
             return
         if plan["kind"] == "unknown":
             raise ValueError("认不出这个地址要下什么")
+        # 用户手填的文件名优先级最高
+        if t.get("want_filename"):
+            plan["filename"] = safe_filename(t["want_filename"])
+
+        # 非 GitHub 链接先做一次 HEAD 预检：文件名/大小/是不是网页。GitHub 的
+        # release 直链文件名本来就在 URL 里，省掉这一次往返。
+        if plan["kind"] == "external":
+            task_log(t, "先探一下这个链接（文件名 / 大小 / 是不是网页）…")
+            info = probe_url(plan, t)
+            if info.get("ok"):
+                if info.get("final_url"):
+                    plan["url"] = info["final_url"]
+                if info.get("filename") and not t.get("want_filename"):
+                    if not plan.get("filename") or plan["filename"] in ("download.bin", "download"):
+                        plan["filename"] = info["filename"]
+                if info.get("size"):
+                    with LOCK:
+                        t["total"] = info["size"]
+                ctype = info.get("ctype") or "?"
+                task_log(t, "  http=%s 类型=%s%s" % (
+                    info.get("code") or "-", ctype,
+                    "，大小 " + fmt_bytes(info["size"]) if info.get("size") else ""))
+                keep_html = t.get("force_html") or plan["url"].lower().split("?")[0].endswith((".html", ".htm"))
+                if info.get("html") and not keep_html:
+                    raise ValueError(
+                        "这个链接返回的是网页（text/html），不是文件。可能是登录页或分享页；"
+                        "如果它确实就是你要的网页文件，勾上「网页也照下」再试。")
+            else:
+                task_log(t, "  预检没成功（%s），直接按原链接下，不影响后面的换源重试"
+                         % (info.get("error") or ("http %s" % info.get("code"))))
+
         os.makedirs(t["destdir"], exist_ok=True)
         with LOCK:
-            t["plan"] = {k: plan.get(k) for k in ("kind", "url", "filename", "repo", "note")}
-        if plan.get("filename"):
+            t["plan"] = {k: plan.get(k) for k in
+                         ("kind", "url", "filename", "repo", "note", "is_github", "host", "direct_first")}
+        if plan.get("filename") and not reuse:
             real = unique_dest(t["destdir"], plan["filename"])
             with LOCK:
                 # 记成落盘时真正用的名字：同名会自动变 (2)，界面不能还写着老名字
@@ -1119,7 +1338,10 @@ def run_task(tid):
             with LOCK:
                 t.update(state="canceled" if t.get("cancel") else "failed", finished=time.time())
                 if t["state"] == "failed":
-                    t["error"] = "所有启用中的源都没拿下这个文件，展开日志看每次失败的原因"
+                    t["error"] = ("所有启用中的源都没拿下这个文件，展开日志看每次失败的原因"
+                                  if plan.get("is_github") else
+                                  "直连没拿下这个文件，展开日志看原因（内网系统常需要填 Referer/Cookie，"
+                                  "或在设置里填公司代理）")
             # 失败/取消不能在你的目录里留下临时文件：.hdr 一律清掉；
             # .part 只在"一个字节都没进来"时清，真下到一半的留着（日志里能看到位置）。
             pbase = (t.get("dest") or "") + ".part"
@@ -1133,6 +1355,7 @@ def run_task(tid):
             add_history({"key": t["url"] + "|" + os.path.basename(dest or "失败"),
                          "at": time.strftime("%Y-%m-%d %H:%M:%S"), "name": t.get("filename") or "（失败）",
                          "path": dest, "url": t["url"], "proxy": t.get("proxy_used"),
+                         "host": plan.get("host"), "kind": plan.get("kind"),
                          "attempts": len(t.get("attempts", [])), "bytes": t.get("downloaded"),
                          "secs": round(time.time() - t["started"], 1), "speed": t.get("speed"),
                          "sha256": None, "verify": "失败", "ok": False})
@@ -1143,7 +1366,7 @@ def run_task(tid):
         v = {}
         if plan["kind"] != "clone" and cfg_verify():
             v = run_checks(dest)
-            if v.get("sha256"):
+            if v.get("sha256") and plan.get("is_github"):
                 v["checksum"] = official_checksum(plan, v["sha256"])
         elif plan["kind"] == "clone":
             v = {"bytes": t.get("downloaded"), "note": "git 仓库，完整性由 git 自己保证"}
@@ -1155,14 +1378,26 @@ def run_task(tid):
         add_history({"key": t["url"] + "|" + os.path.basename(dest),
                      "at": time.strftime("%Y-%m-%d %H:%M:%S"),
                      "name": os.path.basename(dest), "path": dest, "url": t["url"],
-                     "proxy": t.get("proxy_used"), "attempts": len(t.get("attempts", [])),
+                     "proxy": t.get("proxy_used"), "host": plan.get("host"), "kind": plan.get("kind"),
+                     "attempts": len(t.get("attempts", [])),
                      "bytes": v.get("bytes"), "secs": round(secs, 1), "speed": t.get("speed"),
                      "sha256": v.get("sha256"), "verify": summarize_verify(v), "ok": True})
+    except ValueError as e:
+        # 预检发现"这是网页"、链接写错这类是用户可读的失败，不要往 server.log 里灌整段栈
+        with LOCK:
+            t.update(state="failed", finished=time.time(), error=str(e))
+        task_log(t, "失败：%s" % e)
     except Exception as e:
         log(traceback.format_exc())
         with LOCK:
             t.update(state="failed", finished=time.time(), error="%s: %s" % (type(e).__name__, e))
         task_log(t, "异常：%s: %s" % (type(e).__name__, e))
+    finally:
+        if held:
+            try:
+                SEM.release()
+            except ValueError:
+                pass
 
 
 def cfg_verify():
@@ -1171,30 +1406,356 @@ def cfg_verify():
 
 def task_public(t):
     keep = ("id", "url", "mode", "destdir", "filename", "dest", "state", "proxy", "proxy_used",
-            "downloaded", "total", "speed", "error", "log", "verify", "plan", "attempts", "secs")
+            "downloaded", "total", "speed", "error", "log", "verify", "plan", "attempts", "secs",
+            "outputs", "convert_items", "engine", "want_filename", "target")
     d = {k: t.get(k) for k in keep}
     d["elapsed"] = round((t.get("finished") or time.time()) - (t.get("started") or time.time()), 1)
     d["eta"] = None
     if d.get("state") == "downloading" and d.get("total") and d.get("speed"):
         d["eta"] = int(max(d["total"] - (d.get("downloaded") or 0), 0) / d["speed"])
+    # 失败/取消后如果还留着 .part，界面给一个「继续」；有没有半截文件由后端说了算
+    if t.get("mode") in ("convert", "install"):
+        d["resumable"] = t.get("state") in ("failed", "canceled")
+    else:
+        d["resumable"] = bool(t.get("dest")) and (
+            os.path.exists((t.get("dest") or "") + ".part")
+            or t.get("state") in ("failed", "canceled"))
     return d
 
 
-def start_task(url, destdir, mode):
+def remember_dir(path):
+    """记住这次下到哪：下次打开页面默认填它，最近目录最多 8 条。"""
+    try:
+        cfg = get_config()
+        d = os.path.abspath(path)
+        cfg["last_dir"] = d
+        old = [x for x in (cfg.get("recent_dirs") or []) if x and os.path.abspath(x) != d]
+        cfg["recent_dirs"] = ([d] + old)[:8]
+        write_json(CONFIG_F, cfg)
+    except OSError as e:
+        log("记住目录失败：%s" % e)
+
+
+def start_task(url, destdir, mode, filename="", headers=None, force_html=False):
     cfg = get_config()
-    target = expand_path(destdir or cfg["default_dir"])
+    raw_dir = (destdir or "").strip() or (cfg.get("last_dir") or "").strip() or cfg["default_dir"]
+    target = expand_path(raw_dir)
     if not target:
         raise ValueError("下载目录是空的")
     os.makedirs(target, exist_ok=True)
+    remember_dir(target)
     tid = uuid.uuid4().hex[:8]
-    t = {"id": tid, "url": url, "mode": mode, "destdir": target, "state": "queued",
+    hdrs = {}
+    for k in ("referer", "cookie", "authorization", "user_agent"):
+        v = str((headers or {}).get(k) or "").strip()
+        if v:
+            hdrs[k] = v[:8192]
+    t = {"id": tid, "url": url, "mode": mode if mode in ("auto", "file", "clone") else "auto",
+         "destdir": target, "state": "queued",
          "filename": "", "dest": "", "downloaded": 0, "total": None, "speed": 0.0,
          "attempts": [], "log": [], "verify": None, "error": None,
-         "started": time.time(), "finished": None, "cancel": False}
+         "started": time.time(), "finished": None, "cancel": False,
+         "want_filename": safe_filename(filename) if (filename or "").strip() else "",
+         "headers": hdrs, "force_html": bool(force_html)}
     with LOCK:
         TASKS[tid] = t
     threading.Thread(target=run_task, args=(tid,), daemon=True).start()
     return t
+
+
+def retry_task(tid):
+    """失败/取消后从 .part 接着下；转换任务则原样重跑。"""
+    with LOCK:
+        t = TASKS.get(tid)
+        if not t:
+            raise ValueError("任务不在了（服务重启过？）")
+        if t.get("state") in BUSY_STATES:
+            raise ValueError("这个任务还在跑，先取消再继续")
+        t.update(cancel=False, error=None, finished=None, started=time.time(),
+                 state="queued", speed=0.0, downloaded=0, attempts=[])
+        if t.get("mode") in ("convert", "install"):
+            t["outputs"] = []
+            t["convert_items"] = []
+        t["reuse"] = bool(t.get("dest") or t.get("mode") == "convert")
+        t.setdefault("log", []).append("[%s] 继续/重试" % time.strftime("%H:%M:%S"))
+    threading.Thread(target=run_task, args=(tid,), daemon=True).start()
+    return t
+
+
+# =========================================================== 转换任务
+
+def start_convert_task(paths, target, outdir, options):
+    if CONV is None:
+        raise ValueError("转换模块加载失败：%s" % CONV_ERR)
+    cfg = get_config()
+    raw_dir = (outdir or "").strip() or (cfg.get("last_dir") or "").strip() or cfg["default_dir"]
+    target_dir = expand_path(raw_dir)
+    if not target_dir:
+        raise ValueError("输出目录是空的")
+    os.makedirs(target_dir, exist_ok=True)
+    remember_dir(target_dir)
+    paths = [expand_path(p) for p in (paths or []) if str(p or "").strip()]
+    if not paths:
+        raise ValueError("还没选文件")
+    missing = [p for p in paths if not os.path.isfile(p)]
+    if missing:
+        raise ValueError("找不到文件：%s" % missing[0])
+    if not isinstance(target, dict) or not target.get("ext"):
+        raise ValueError("没选目标格式")
+    tid = uuid.uuid4().hex[:8]
+    ext = str(target.get("ext")).lstrip(".").lower()
+    t = {"id": tid, "url": "、".join(os.path.basename(p) for p in paths[:3]) +
+                             (" 等 %d 个" % len(paths) if len(paths) > 3 else ""),
+         "mode": "convert", "destdir": target_dir, "state": "queued",
+         "filename": "%d 个文件 → .%s" % (len(paths), ext),
+         "dest": target_dir, "downloaded": 0, "total": len(paths), "speed": 0.0,
+         "attempts": [], "log": [], "verify": None, "error": None,
+         "started": time.time(), "finished": None, "cancel": False,
+         "paths": paths, "target": target, "options": options or {},
+         "outputs": [], "convert_items": []}
+    with LOCK:
+        TASKS[tid] = t
+    threading.Thread(target=run_task, args=(tid,), daemon=True).start()
+    return t
+
+
+def run_convert_task(t):
+    held = False
+    try:
+        SEM.acquire()
+        held = True
+        with LOCK:
+            t["state"] = "converting"
+        engines = CONV.detect_engines(get_config(), DATA)
+
+        def tlog(msg):
+            with LOCK:
+                t.setdefault("log", []).append("[%s] %s" % (time.strftime("%H:%M:%S"), msg))
+                t["log"] = t["log"][-300:]
+                m = re.match(r"^\[(\d+)/(\d+)\]", msg or "")
+                if m:
+                    t["downloaded"] = max(0, int(m.group(1)) - 1)
+                    t["total"] = int(m.group(2))
+            log("[转换 %s] %s" % (t["id"], msg))
+
+        res = CONV.convert_batch(t["paths"], t["target"], t["destdir"],
+                                 t.get("options") or {}, tlog,
+                                 cancel=lambda: bool(t.get("cancel")),
+                                 engines=engines)
+        ok_items = [x for x in res["items"] if x.get("ok")]
+        bad_items = [x for x in res["items"] if not x.get("ok")]
+        with LOCK:
+            t["outputs"] = res.get("outputs") or []
+            t["convert_items"] = res.get("items") or []
+            t["downloaded"] = len(ok_items)
+            t["total"] = len(res.get("items") or [])
+            t["finished"] = time.time()
+            if t.get("cancel"):
+                t["state"] = "canceled"
+                t["error"] = "已取消（已转好的文件仍然保留）"
+            elif ok_items:
+                t["state"] = "done"
+                note = "转换完成 %d 个文件" % len(ok_items)
+                if bad_items:
+                    note += "，%d 个失败（展开日志看原因）" % len(bad_items)
+                t["verify"] = {"note": note}
+            else:
+                t["state"] = "failed"
+                t["error"] = "所有文件都没转成功，展开日志看原因"
+    except Exception as e:
+        log(traceback.format_exc())
+        with LOCK:
+            t.update(state="failed", finished=time.time(),
+                     error="%s: %s" % (type(e).__name__, e))
+        task_log(t, "转换异常：%s: %s" % (type(e).__name__, e))
+    finally:
+        if held:
+            try:
+                SEM.release()
+            except ValueError:
+                pass
+
+
+# =========================================================== 可选引擎按需下载
+
+ENGINE_REPOS = {
+    "magick": {
+        "repo": "ImageMagick/ImageMagick",
+        # 优先 Q16 常规便携包；没有就退而求其次拿任意 x64 portable zip
+        "pick": lambda n: n.endswith(".zip") and "portable-Q16-x64" in n,
+        "fallback": lambda n: n.endswith(".zip") and "portable" in n and "x64" in n,
+        "exe": "magick.exe",
+    },
+    "pandoc": {
+        "repo": "jgm/pandoc",
+        "pick": lambda n: n.startswith("pandoc-") and n.endswith("windows-x86_64.zip"),
+        "fallback": lambda n: n.endswith("windows-x86_64.zip"),
+        "exe": "pandoc.exe",
+    },
+}
+
+
+def _github_json(url):
+    """按 直连 → 代理 的顺序取 GitHub API JSON。"""
+    tried = []
+    for px in [{"name": "直连", "prefix": ""}] + pick_order():
+        target = norm_prefix(px.get("prefix")) + url
+        rc, out = curl(["-sS", "-L", "--max-time", "20",
+                        "-H", "Accept: application/vnd.github+json",
+                        "-H", "User-Agent: ghdl-local",
+                        "-w", "|CODE|%{http_code}"] + proxy_args() + [target], timeout=30)
+        body, _, code_s = out.rpartition("|CODE|")
+        try:
+            code = int(code_s.strip())
+        except ValueError:
+            code = 0
+        tried.append("%s→%s" % (px.get("name"), code or rc))
+        if code == 200 and body.strip().startswith("{"):
+            try:
+                return json.loads(body), None
+            except ValueError:
+                continue
+    return None, "GitHub API 取不到（%s）" % "，".join(tried[:5])
+
+
+def start_install_task(engine_id):
+    if engine_id not in ENGINE_REPOS:
+        raise ValueError("不认识这个引擎：%s" % engine_id)
+    tid = uuid.uuid4().hex[:8]
+    t = {"id": tid, "url": ENGINE_REPOS[engine_id]["repo"], "mode": "install",
+         "engine": engine_id, "destdir": os.path.join(DATA, "engines"),
+         "filename": "下载 %s 便携版" % ("ImageMagick" if engine_id == "magick" else "Pandoc"),
+         "dest": "", "state": "queued", "downloaded": 0, "total": None, "speed": 0.0,
+         "attempts": [], "log": [], "verify": None, "error": None,
+         "started": time.time(), "finished": None, "cancel": False, "outputs": []}
+    with LOCK:
+        TASKS[tid] = t
+    threading.Thread(target=run_task, args=(tid,), daemon=True).start()
+    return t
+
+
+def run_install_task(t):
+    held = False
+    try:
+        SEM.acquire()
+        held = True
+        engine_id = t.get("engine")
+        meta = ENGINE_REPOS.get(engine_id)
+        if not meta:
+            raise ValueError("不认识的引擎")
+        with LOCK:
+            t["state"] = "installing"
+        tlog = lambda m: (task_log(t, m), None)[1]
+
+        tlog("向 GitHub 查 %s 的最新发布…" % meta["repo"])
+        data, err = _github_json("https://api.github.com/repos/%s/releases/latest" % meta["repo"])
+        if not data:
+            raise RuntimeError(err + "；可以手动下载后放到 data/engines/ 下")
+        assets = data.get("assets") or []
+        pick = next((a for a in assets if meta["pick"](a.get("name") or "")), None)
+        if not pick:
+            pick = next((a for a in assets if meta["fallback"](a.get("name") or "")), None)
+        if not pick:
+            raise RuntimeError("这个 release 里没找到便携包，请手动下载：%s"
+                               % data.get("html_url", ""))
+        url = pick.get("browser_download_url")
+        size = pick.get("size") or 0
+        tlog("找到 %s（%s），开始下载" % (pick.get("name"), fmt_bytes(size)))
+        with LOCK:
+            t["total"] = size or None
+            t["url"] = url
+
+        edir = os.path.join(DATA, "engines")
+        os.makedirs(edir, exist_ok=True)
+        zpath = os.path.join(edir, "%s-%s" % (engine_id, safe_filename(pick.get("name"), "engine.zip")))
+        order = [p for p in pick_order() if p.get("prefix")] + [p for p in pick_order() if not p.get("prefix")]
+        ok = False
+        for px in order:
+            if t.get("cancel"):
+                raise RuntimeError("已取消")
+            target = norm_prefix(px.get("prefix")) + url
+            tlog("用 %s 下载 %s" % (px.get("name"), pick.get("name")))
+            proc = subprocess.Popen(
+                [CURL, "-sS", "-L", "--fail", "--connect-timeout", "12",
+                 "-o", zpath, "-w", "%{http_code}|%{size_download}"] + proxy_args() + [target],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            with LOCK:
+                t["proc"] = proc
+            last = -1
+            while proc.poll() is None:
+                time.sleep(0.4)
+                try:
+                    got = os.path.getsize(zpath)
+                except OSError:
+                    got = 0
+                if got != last:
+                    last = got
+                    with LOCK:
+                        t["downloaded"] = got
+                        t["state"] = "installing"
+                if t.get("cancel"):
+                    reap(proc)
+                    with LOCK:
+                        t["proc"] = None
+                    raise RuntimeError("已取消")
+            out = decode_out(read_pipe(proc))
+            with LOCK:
+                t["proc"] = None
+            if proc.returncode == 0 and os.path.exists(zpath) and os.path.getsize(zpath) > 1000:
+                ok = True
+                break
+            tlog("  这个源没成（curl 退出码 %s）" % proc.returncode)
+        with LOCK:
+            t["proc"] = None
+        if not ok:
+            raise RuntimeError("所有源都没下下来，可以手动下载后放到 data/engines/")
+
+        tlog("下载完成，解压中…")
+        dest = os.path.join(edir, engine_id)
+        shutil.rmtree(dest, ignore_errors=True)
+        os.makedirs(dest, exist_ok=True)
+        with zipfile.ZipFile(zpath) as z:
+            for m in z.infolist():
+                name = m.filename.replace("\\", "/")
+                if name.startswith("/") or ".." in name.split("/"):
+                    continue
+                z.extract(m, dest)
+        try:
+            os.unlink(zpath)
+        except OSError:
+            pass
+        exe = None
+        for dirpath, _dirs, files in os.walk(dest):
+            if meta["exe"].lower() in [f.lower() for f in files]:
+                exe = os.path.join(dirpath, [f for f in files if f.lower() == meta["exe"].lower()][0])
+                break
+        if not exe:
+            raise RuntimeError("解压完了但没找到 %s，请手动指定路径" % meta["exe"])
+        cfg = get_config()
+        if not isinstance(cfg.get("engines"), dict):
+            cfg["engines"] = {}
+        cfg["engines"][engine_id] = exe
+        write_json(CONFIG_F, cfg)
+        if CONV:
+            CONV.detect_engines(cfg, DATA, force=True)
+        with LOCK:
+            t.update(state="done", finished=time.time(), dest=os.path.dirname(exe),
+                     filename=meta["exe"],
+                     verify={"note": "已装好：%s" % exe})
+        tlog("装好了：%s" % exe)
+    except Exception as e:
+        log(traceback.format_exc())
+        with LOCK:
+            t.update(state="failed", finished=time.time(),
+                     error="%s: %s" % (type(e).__name__, e))
+        task_log(t, "安装失败：%s" % e)
+    finally:
+        if held:
+            try:
+                SEM.release()
+            except ValueError:
+                pass
 
 
 # =========================================================== release 页列文件 / 目录浏览
@@ -1267,11 +1828,117 @@ def list_dirs(path, want_files=False):
         return {"path": path, "parent": None, "items": [], "files": [], "error": "打不开：%s" % e}
 
 
+def make_dir(parent, name):
+    if not (parent or "").strip():
+        raise ValueError("先进入一个盘符或目录，再新建文件夹")
+    parent = expand_path(parent)
+    name = (name or "").strip()
+    if not parent or not os.path.isdir(parent):
+        raise ValueError("上级目录不存在：%s" % parent)
+    if not name or name in (".", "..") or re.search(r'[\\/:*?"<>|]', name):
+        raise ValueError("文件夹名不能为空，也不能包含 \\ / : * ? \" < > |")
+    p = os.path.join(parent, name)
+    os.makedirs(p, exist_ok=False)
+    return p
+
+
+def _dialog_script(kind="dir", initial="", filter_kind=""):
+    """生成弹原生选择框的 PowerShell 脚本。单独拆出来是为了能在自测里做语法检查，
+    不用真的把框弹到用户脸上。"""
+    initial = (initial or "").strip().strip('"')
+    if initial and os.path.isfile(initial):
+        initial = os.path.dirname(initial)
+    if initial and not os.path.isdir(initial):
+        initial = ""
+    esc = initial.replace("'", "''")
+    common = [
+        "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8",
+        "$ErrorActionPreference='Stop'",
+        "Add-Type -AssemblyName System.Windows.Forms",
+        "Add-Type -AssemblyName System.Drawing",
+        "$owner = New-Object System.Windows.Forms.Form",
+        "$owner.Text = 'ghdl'; $owner.ShowInTaskbar = $false",
+        "$owner.FormBorderStyle = 'None'; $owner.Size = New-Object System.Drawing.Size(1,1)",
+        "$owner.StartPosition = 'CenterScreen'; $owner.TopMost = $true; $owner.Show(); $owner.Activate()",
+    ]
+    if kind == "files":
+        filters = {
+            "image": "图片|*.jpg;*.jpeg;*.png;*.webp;*.avif;*.bmp;*.gif;*.tif;*.tiff;*.ico;*.heic;*.heif|所有文件|*.*",
+            "doc": "文档|*.doc;*.docx;*.odt;*.rtf;*.txt;*.md;*.html;*.xls;*.xlsx;*.ods;*.csv;*.ppt;*.pptx;*.odp;*.pdf|所有文件|*.*",
+            "media": "音视频|*.mp4;*.mkv;*.mov;*.avi;*.webm;*.mp3;*.wav;*.flac;*.m4a;*.ogg;*.gif|所有文件|*.*",
+        }.get(filter_kind, "所有文件|*.*")
+        tail = [
+            "$d = New-Object System.Windows.Forms.OpenFileDialog",
+            "$d.Multiselect = $true; $d.CheckFileExists = $true",
+            "$d.Title = '选择要转换的文件'",
+            "$d.Filter = '%s'" % filters,
+            ("if ('%s' -ne '') { $d.InitialDirectory = '%s' }" % (esc, esc)) if esc else "if ($false) {}",
+            "if ($d.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) {",
+            "  $d.FileNames | ForEach-Object { Write-Output $_ }",
+            "}",
+            "$owner.Close()",
+        ]
+    else:
+        tail = [
+            "$d = New-Object System.Windows.Forms.FolderBrowserDialog",
+            "$d.Description = '选择目录'; $d.ShowNewFolderButton = $true",
+            ("if ('%s' -ne '') { $d.SelectedPath = '%s' }" % (esc, esc)) if esc else "if ($false) {}",
+            "if ($d.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) {",
+            "  Write-Output $d.SelectedPath",
+            "}",
+            "$owner.Close()",
+        ]
+    return "\r\n".join(common + tail) + "\r\n"
+
+
+def pick_paths(kind="dir", initial="", filter_kind=""):
+    """
+    弹 Windows 原生选择框（文件夹 / 多选文件）。服务本身是个无窗口进程，
+    所以这里用 PowerShell + WinForms 起一个交给系统，比网页里一层层点目录树省事。
+    选完把绝对路径一行一个写回；取消就是空。
+    """
+    if not _WIN:
+        return {"ok": False, "error": "原生选择框只支持 Windows", "fallback": True}
+    if not DIALOG_LOCK.acquire(blocking=False):
+        return {"ok": False, "error": "已经有一个选择框开着，先在那边选完", "fallback": True}
+    tmp = None
+    try:
+        script = _dialog_script(kind, initial, filter_kind)
+        fd, tmp = tempfile.mkstemp(suffix=".ps1")
+        os.close(fd)
+        with open(tmp, "w", encoding="utf-8-sig", newline="\r\n") as f:
+            f.write(script)
+        ps = shutil.which("powershell.exe") or "powershell.exe"
+        p = subprocess.run([ps, "-NoProfile", "-STA", "-ExecutionPolicy", "Bypass", "-File", tmp],
+                           capture_output=True, timeout=300,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        out = decode_out(p.stdout or b"")
+        err = decode_out(p.stderr or b"")
+        paths = [ln.strip() for ln in out.splitlines() if ln.strip()]
+        paths = [x for x in paths if os.path.exists(x)]
+        if p.returncode != 0 and not paths:
+            return {"ok": False, "error": "选择框起不来：%s" % (err.strip()[-240:] or p.returncode),
+                    "fallback": True}
+        return {"ok": True, "paths": paths}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": "等了 5 分钟没选，已放弃", "fallback": False}
+    except Exception as e:
+        return {"ok": False, "error": "选择框失败：%s: %s" % (type(e).__name__, e), "fallback": True}
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        DIALOG_LOCK.release()
+
+
 # =========================================================== HTTP 接口
 
 CTYPES = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8",
           ".js": "application/javascript; charset=utf-8", ".svg": "image/svg+xml",
-          ".ico": "image/x-icon", ".txt": "text/plain; charset=utf-8",
+          ".ico": "image/x-icon", ".png": "image/png",
+          ".txt": "text/plain; charset=utf-8",
           ".md": "text/plain; charset=utf-8", ".map": "application/json; charset=utf-8"}
 
 
@@ -1332,7 +1999,12 @@ class Handler(BaseHTTPRequestHandler):
         path = u.path
         q = {k: v[0] for k, v in parse_qs(u.query).items()}
         try:
-            if path in ("/", "/index.html", "/favicon.ico"):
+            if path in ("/", "/index.html"):
+                return self.send_file(os.path.join(STATIC, "index.html"))
+            if path == "/favicon.ico":
+                fp = os.path.join(STATIC, "logo.ico")
+                if os.path.exists(fp):
+                    return self.send_file(fp)
                 return self.send_file(os.path.join(STATIC, "index.html"))
             if path.startswith("/static/"):
                 rel = os.path.normpath(path[len("/static/"):]).lstrip("\\/")
@@ -1350,21 +2022,58 @@ class Handler(BaseHTTPRequestHandler):
 
     def api(self, path, q, body):
         if path == "/api/state":
+            cfg = get_config()
+            engines = CONV.detect_engines(cfg, DATA) if CONV else {"error": CONV_ERR}
             with LOCK:
                 tasks = [task_public(t) for t in sorted(TASKS.values(), key=lambda x: -(x.get("started") or 0))[:30]]
-            return self.send_json({"ok": True, "version": APP_VERSION, "config": get_config(),
+            return self.send_json({"ok": True, "version": APP_VERSION, "config": cfg,
                                    "proxies": get_proxies(), "tasks": tasks,
-                                   "history": get_history()[:80],
+                                   "history": get_history()[:80], "engines": engines,
+                                   "conv_error": CONV_ERR,
                                    "up": int(time.time() - STARTED_AT)})
 
         if path == "/api/download":
-            url = (body.get("url") or "").strip()
-            if not url:
+            raw = body.get("urls")
+            if raw is None:
+                raw = [body.get("url") or ""]
+            if isinstance(raw, str):
+                raw = [raw]
+            urls, seen = [], set()
+            for chunk in raw:
+                for u in re.split(r"[\r\n]+", str(chunk or "")):
+                    u = u.strip().strip('"').strip("'")
+                    if u and u not in seen:
+                        seen.add(u)
+                        urls.append(u)
+            if not urls:
                 return self.send_json({"ok": False, "error": "链接还没填"})
+            if len(urls) > 50:
+                return self.send_json({"ok": False, "error": "一次最多 50 个链接，分两批吧"})
+            destdir = body.get("destdir") or ""
+            mode = body.get("mode") or "auto"
+            headers = body.get("headers") or {}
+            filename = (body.get("filename") or "").strip() if len(urls) == 1 else ""
+            force_html = bool(body.get("force_html"))
+            tasks, errs = [], []
+            for u in urls:
+                try:
+                    t = start_task(u, destdir, mode, filename, headers, force_html)
+                    tasks.append(t)
+                except (OSError, ValueError) as e:
+                    errs.append("%s → %s" % (u[:60], e))
+            if not tasks:
+                return self.send_json({"ok": False, "error": "一个都没启动：%s" % "；".join(errs[:3])})
+            out = {"ok": True, "tasks": [task_public(t) for t in tasks]}
+            out["task"] = out["tasks"][0]          # 兼容旧前端/旧脚本
+            if errs:
+                out["warnings"] = errs
+            return self.send_json(out)
+
+        if path == "/api/retry":
             try:
-                t = start_task(url, body.get("destdir") or "", body.get("mode") or "auto")
+                t = retry_task(body.get("id"))
             except (OSError, ValueError) as e:
-                return self.send_json({"ok": False, "error": "目录不能用：%s" % e})
+                return self.send_json({"ok": False, "error": str(e)})
             return self.send_json({"ok": True, "task": task_public(t)})
 
         if path == "/api/task":
@@ -1432,20 +2141,69 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({"ok": True, "proxies": get_proxies()})
 
         if path == "/api/config":
+            global SEM
             cfg = get_config()
+            restart = False
             if "default_dir" in body:
-                cfg["default_dir"] = expand_path(body["default_dir"]) or default_downloads_dir()
+                raw = str(body.get("default_dir") or "").strip()
+                cfg["default_dir"] = expand_path(raw) if raw else default_downloads_dir()
+            if "last_dir" in body:
+                raw = str(body.get("last_dir") or "").strip()
+                cfg["last_dir"] = expand_path(raw) if raw else ""
             if "quick_dirs" in body:
                 dirs = []
                 for d in body.get("quick_dirs") or []:
+                    if not str(d or "").strip():
+                        continue
                     d = expand_path(d)
                     if d and d not in dirs:
                         dirs.append(d)
                 cfg["quick_dirs"] = dirs[:8]
+            if "recent_dirs" in body:
+                dirs = []
+                for d in body.get("recent_dirs") or []:
+                    if not str(d or "").strip():
+                        continue
+                    d = expand_path(d)
+                    if d and d not in dirs:
+                        dirs.append(d)
+                cfg["recent_dirs"] = dirs[:8]
+            if "max_concurrent" in body:
+                try:
+                    n = max(1, min(8, int(body.get("max_concurrent") or 3)))
+                except (TypeError, ValueError):
+                    n = 3
+                cfg["max_concurrent"] = n
+                with LOCK:
+                    busy = any(t.get("state") in BUSY_STATES for t in TASKS.values())
+                if not busy:
+                    SEM = threading.BoundedSemaphore(n)
+                else:
+                    restart = True          # 有任务在跑时不换闸门，下次启动生效
+            if "proxy_url" in body:
+                cfg["proxy_url"] = str(body.get("proxy_url") or "").strip()[:300]
+            if "external_proxy" in body:
+                cfg["external_proxy"] = bool(body.get("external_proxy"))
+            if "user_agent" in body:
+                cfg["user_agent"] = str(body.get("user_agent") or "").strip()[:300]
+            if "engines" in body and isinstance(body.get("engines"), dict):
+                eng = dict(cfg.get("engines") or {})
+                for k, v in body["engines"].items():
+                    if k not in ("libreoffice", "ffmpeg", "magick", "pandoc"):
+                        continue
+                    raw = str(v or "").strip()
+                    v = expand_path(raw) if raw else ""
+                    if v:
+                        eng[k] = v
+                    else:
+                        eng.pop(k, None)
+                cfg["engines"] = eng
+                if CONV:
+                    CONV.detect_engines(cfg, DATA, force=True)
             if "verify" in body:
                 cfg["verify"] = bool(body["verify"])
             write_json(CONFIG_F, cfg)
-            return self.send_json({"ok": True, "config": cfg})
+            return self.send_json({"ok": True, "config": cfg, "restart_required": restart})
 
         if path == "/api/assets":
             return self.send_json(release_assets(q.get("url") or body.get("url") or ""))
@@ -1453,6 +2211,53 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/ls":
             return self.send_json(list_dirs(q.get("path") or body.get("path") or "",
                                              bool(q.get("files")) or bool(body.get("files"))))
+
+        if path == "/api/mkdir":
+            try:
+                p = make_dir(body.get("parent") or "", body.get("name") or "")
+            except FileExistsError:
+                return self.send_json({"ok": False, "error": "这个文件夹已经存在"})
+            except (OSError, ValueError) as e:
+                return self.send_json({"ok": False, "error": str(e)})
+            return self.send_json({"ok": True, "path": p})
+
+        if path == "/api/pickdir":
+            return self.send_json(pick_paths("dir", q.get("initial") or body.get("initial") or ""))
+
+        if path == "/api/pickfiles":
+            return self.send_json(pick_paths("files", q.get("initial") or body.get("initial") or "",
+                                              q.get("kind") or body.get("kind") or ""))
+
+        if path == "/api/formats":
+            if CONV is None:
+                return self.send_json({"ok": False, "error": "转换模块没加载：%s" % CONV_ERR})
+            paths = body.get("paths") or q.get("paths") or []
+            if isinstance(paths, str):
+                paths = [x for x in paths.splitlines() if x.strip()]
+            return self.send_json(CONV.targets_for(paths, get_config(), DATA))
+
+        if path == "/api/convert":
+            if CONV is None:
+                return self.send_json({"ok": False, "error": "转换模块没加载：%s" % CONV_ERR})
+            paths = body.get("paths") or []
+            if isinstance(paths, str):
+                paths = [x for x in paths.splitlines() if x.strip()]
+            try:
+                t = start_convert_task(paths, body.get("target") or {},
+                                       body.get("outdir") or "", body.get("options") or {})
+            except (OSError, ValueError) as e:
+                return self.send_json({"ok": False, "error": str(e)})
+            return self.send_json({"ok": True, "task": task_public(t)})
+
+        if path == "/api/engineinstall":
+            try:
+                t = start_install_task(body.get("id") or "")
+            except (OSError, ValueError) as e:
+                return self.send_json({"ok": False, "error": str(e)})
+            return self.send_json({"ok": True, "task": task_public(t)})
+
+        if path == "/api/engine/install":
+            return self.api("/api/engineinstall", q, body)
 
         if path == "/api/verify":
             try:
@@ -1512,7 +2317,7 @@ def find_port(base, tries=8):
 
 
 def main():
-    global SERVER
+    global SERVER, SEM
     if "--version" in sys.argv:
         say("ghdl %s（打包版=%s）" % (APP_VERSION, FROZEN))
         return
@@ -1529,6 +2334,10 @@ def main():
         return
     ensure_data()
     cfg = get_config()
+    try:
+        SEM = threading.BoundedSemaphore(max(1, min(8, int(cfg.get("max_concurrent") or 3))))
+    except (TypeError, ValueError):
+        SEM = threading.BoundedSemaphore(3)
     base_port = int(os.environ.get("GHDL_PORT") or cfg.get("port") or 8765)
     port = find_port(base_port)
     httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)

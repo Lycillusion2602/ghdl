@@ -24,8 +24,10 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: 装 PyInstaller
-        run: python -m pip install --upgrade pip pyinstaller
+      - name: 装 PyInstaller 和转换依赖
+        run: |
+          python -m pip install --upgrade pip pyinstaller
+          python -m pip install -r requirements.txt
 
       - name: 判断这次是 tag 发布还是手动干跑
         id: gate
@@ -37,7 +39,7 @@ jobs:
         env:
           INPUT_PUBLISH: ${{ github.event.inputs.publish }}
 
-      - name: 版本号必须和 tag 一致（防止 tag 说 1.2.0、界面里写 1.1.0）
+      - name: 版本号必须和 tag 一致（防止 tag 说 1.2.2、界面里写 1.2.1）
         if: steps.gate.outputs.istag == 'true'
         shell: python
         run: |
@@ -54,9 +56,7 @@ jobs:
           GHDL_PORT: "8899"
 
       - name: 构建单文件 exe
-        run: >
-          pyinstaller --noconfirm --clean --onefile --windowed --name ghdl
-          --add-data "static;static" server.py
+        run: pyinstaller --noconfirm --clean ghdl.spec
 
       - name: 算 SHA256 写进 Release 说明
         if: steps.gate.outputs.publish == 'true'
@@ -65,7 +65,7 @@ jobs:
           $h = (Get-FileHash dist\ghdl.exe -Algorithm SHA256).Hash.ToLower()
           $v = $env:GITHUB_REF_NAME
           @"
-          ghdl $v —— 单文件 GitHub 代理下载器。下载 ``ghdl.exe`` 双击即可，不需要装 Python。
+          ghdl $v —— 单文件下载器 + 格式转换器。下载 ``ghdl.exe`` 双击即可，不需要装 Python。
 
           | 项 | 值 |
           |---|---|
@@ -74,11 +74,14 @@ jobs:
 
           **没有代码签名**：首次运行 Windows 会弹 SmartScreen「未知发布者」，点「更多信息 → 仍要运行」。
           这是未签名 PyInstaller 单文件程序的正常表现。不放心的话先比对上面的 SHA256，
-          或者 clone 源码自己 ``pyinstaller`` 打一份（源码、构建参数、自测脚本全公开）。
+          或者 clone 源码自己 ``pyinstaller ghdl.spec`` 打一份（源码、构建参数、自测脚本全公开）。
 
-          停止服务：页面右上角「停止服务」。数据存在 exe 旁边的 ``data/``。
-          构建环境：GitHub windows-latest runner · Python 3.12 · PyInstaller（见 Actions 日志）。
-          本 Release 由 CI 自动发布：先跑完 selftest（90+ 项）通过才出包。
+          - 下载：GitHub 加速 + 任意 http(s) 链接；批量、断点续传、Referer/Cookie、原生目录选择框。
+          - 转换：图片/PDF 内置引擎；Office 文档用本机 LibreOffice；音视频用本机 ffmpeg；
+            ImageMagick / Pandoc 可在页面里一键下载便携版。
+          - 停止服务：页面右上角「停止服务」。数据存在 exe 旁边的 ``data/``。
+          - 构建环境：GitHub windows-latest runner · Python 3.12 · PyInstaller（见 Actions 日志）。
+          - 本 Release 由 CI 自动发布：先跑完 selftest（110+ 项）通过才出包。
           "@ | Out-File -Encoding utf8 release-notes.md
           Get-Content release-notes.md
 

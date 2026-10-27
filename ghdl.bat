@@ -11,7 +11,7 @@ echo     4  stop     ask a running server to exit
 echo     5  version  print source version
 echo     0  quit
 set op=
-set /p op=  pick: 
+set /p op=  pick:
 if "%op%"=="1" goto run
 if "%op%"=="2" goto test
 if "%op%"=="3" goto pack
@@ -30,8 +30,8 @@ if errorlevel 9009 python selftest.py
 pause
 goto end
 :pack
-py -3 -m PyInstaller --noconfirm --clean --onefile --windowed --name ghdl --add-data "static;static" server.py
-if errorlevel 9009 python -m PyInstaller --noconfirm --clean --onefile --windowed --name ghdl --add-data "static;static" server.py
+py -3 -m pip install -r requirements.txt pyinstaller
+py -3 -m PyInstaller --noconfirm --clean ghdl.spec
 if exist dist\ghdl.exe copy /y dist\ghdl.exe ghdl.exe
 pause
 goto end

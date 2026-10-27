@@ -1,0 +1,6 @@
+# 运行时依赖。发布版由 PyInstaller 打进 ghdl.exe，最终用户不需要装 Python。
+# 只有源码运行 / 自己打包时才需要：py -3 -m pip install -r requirements.txt
+pillow>=11,<14
+pillow-heif>=0.20,<2
+pypdf>=5,<7
+pypdfium2>=4.30,<6
